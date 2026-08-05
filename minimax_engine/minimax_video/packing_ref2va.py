@@ -704,6 +704,13 @@ def sample_reference_video_frames(frames: np.ndarray) -> tuple[list[np.ndarray],
         if not indices or round(cursor) > indices[-1]:
             indices.append(round(cursor))
         cursor += stride
+    if len(indices) < MINIMAX_H3_QWEN_TEMPORAL_PATCH:
+        minimum = round((MINIMAX_H3_QWEN_TEMPORAL_PATCH - 1) * stride) + 1
+        raise ValueError(
+            f"A reference video is read at {MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS:g} fps and its sampled frames are "
+            f"merged in groups of {MINIMAX_H3_QWEN_TEMPORAL_PATCH}, so it must run at least {minimum} frames at "
+            f"{MINIMAX_H3_FPS:g} fps ({minimum / MINIMAX_H3_FPS:.2g} seconds), got {frames.shape[0]}."
+        )
 
     timestamps = [index / MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS for index in range(len(indices))]
     timestamps += [timestamps[-1]] * (-len(timestamps) % MINIMAX_H3_QWEN_TEMPORAL_PATCH)

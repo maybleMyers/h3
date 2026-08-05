@@ -9,6 +9,7 @@ import glob
 import json
 import logging
 import os
+import re
 from typing import List, Optional
 
 import torch
@@ -85,17 +86,48 @@ def _is_fp32_key(key: str) -> bool:
     return any(key.startswith(prefix) for prefix in FP32_KEY_PREFIXES)
 
 
-def convert_peft_lora_to_native(lora_sd: dict, expected_shapes: Optional[dict] = None) -> dict:
-    """Convert an ai-toolkit MiniMax-H3 LoRA (PEFT `lora_A`/`lora_B` keys over the original
-    fused module names) into `lora_down`/`lora_up` pairs on this port's diffusers-layout keys,
-    so the generic merge in `load_safetensors_with_lora_and_fp8` can consume it.
+# Musubi-tuner (h3 branch) LoRA keys: sd-scripts flat naming over the upstream fused module
+# names, e.g. `lora_unet_blocks_36_attn_qkv_proj.lora_down.weight` / `.lora_up.weight` /
+# `.alpha`. Only block-stack modules can be trained there, so the prefix is unambiguous.
+_MUSUBI_LORA_KEY_RE = re.compile(r"^lora_unet_(?:token_refiner_)?blocks_\d+_")
 
-    ai-toolkit vendors the reference model, whose in-memory layout is what
+# Flat spelling -> dotted fused module leaf (the same names the PEFT converter sees).
+_MUSUBI_MODULE_LEAVES = (
+    ("attn_qkv_proj", "attn.qkv_proj"),
+    ("attn_out_proj", "attn.out_proj"),
+    ("mlp_fc1", "mlp.fc1"),
+    ("mlp_fc2", "mlp.fc2"),
+    ("adaln_proj_linear", "adaln_proj.linear"),
+)
+
+
+def _musubi_module_to_fused(module: str) -> str:
+    """`blocks_36_attn_qkv_proj` -> `blocks.36.attn.qkv_proj` (upstream fused dotted form)."""
+    module = re.sub(r"^token_refiner_blocks_(\d+)_", r"token_refiner.blocks.\1.", module)
+    module = re.sub(r"^blocks_(\d+)_", r"blocks.\1.", module)
+    for flat, dotted in _MUSUBI_MODULE_LEAVES:
+        if module.endswith(flat):
+            module = module[: -len(flat)] + dotted
+            break
+    return module
+
+
+def convert_peft_lora_to_native(lora_sd: dict, expected_shapes: Optional[dict] = None) -> dict:
+    """Convert a MiniMax-H3 LoRA trained against the original fused module names into
+    `lora_down`/`lora_up` pairs on this port's diffusers-layout keys, so the generic merge in
+    `load_safetensors_with_lora_and_fp8` can consume it. Two source spellings are recognized:
+    ai-toolkit PEFT (`...attn.qkv_proj.lora_A.weight`) and musubi-tuner sd-scripts flat
+    (`lora_unet_blocks_36_attn_qkv_proj.lora_down.weight`). LoRAs already keyed in diffusers
+    naming pass through untouched.
+
+    Both trainers vendor the reference model, whose in-memory layout is what
     `_convert_minimax_h3_upstream.py` consumes: `qkv_proj` rows are `[q_all; k_all; v_all]`
     and `fc1` rows are `[gate; up]`, while the port splits QKV into `to_q`/`to_k`/`to_v` and
-    stores SwiGLU as `[up; gate]`. Splitting/reordering the `lora_B` rows applies the identical
-    transform to the low-rank delta (`delta_W = B @ A`; a row permutation of `delta_W` is the
-    same row permutation of `B`). The PEFT format carries no alpha keys and ai-toolkit's
+    stores SwiGLU as `[up; gate]`. Splitting/reordering the up-weight rows applies the
+    identical transform to the low-rank delta (`delta_W = B @ A`; a row permutation of
+    `delta_W` is the same row permutation of `B`). The shared down weight and the `.alpha`
+    scalar replicate unchanged across a QKV split — the rank (and thus `alpha/dim`) is
+    unaffected by a row split of B. The PEFT format carries no alpha keys and ai-toolkit's
     runtime scale is alpha/rank == 1.0, which matches the merge's `alpha = dim` fallback.
 
     `expected_shapes` (model key -> weight shape) drops converted pairs that cannot apply to
@@ -103,17 +135,36 @@ def convert_peft_lora_to_native(lora_sd: dict, expected_shapes: Optional[dict] =
     `adaln_proj.linear` deltas over its 8-dim `adaln_t_table` temb, which do not exist in the
     full checkpoint's 2688-dim AdaLN input space and would otherwise crash the merge.
     """
-    if not any(key.endswith((".lora_A.weight", ".lora_B.weight")) for key in lora_sd):
+    if not any(
+        key.endswith((".lora_A.weight", ".lora_B.weight")) or _MUSUBI_LORA_KEY_RE.match(key)
+        for key in lora_sd
+    ):
         return lora_sd
 
     converted = {}
     for key, value in lora_sd.items():
-        if not key.endswith((".lora_A.weight", ".lora_B.weight")):
+        # Normalize the source spellings to (fused dotted base, down/up/alpha).
+        if key.endswith(".lora_A.weight"):
+            base, kind = key[: -len(".lora_A.weight")], "down"
+        elif key.endswith(".lora_B.weight"):
+            base, kind = key[: -len(".lora_B.weight")], "up"
+        elif _MUSUBI_LORA_KEY_RE.match(key):
+            module, _, leaf = key[len("lora_unet_"):].partition(".")
+            if leaf == "lora_down.weight":
+                kind = "down"
+            elif leaf == "lora_up.weight":
+                kind = "up"
+            elif leaf == "alpha":
+                kind = "alpha"
+            else:
+                converted[key] = value
+                continue
+            base = _musubi_module_to_fused(module)
+        else:
             converted[key] = value
             continue
-        is_up = key.endswith(".lora_B.weight")
-        suffix = ".lora_up.weight" if is_up else ".lora_down.weight"
-        base = key[: -len(".lora_A.weight")]
+        suffix = {"down": ".lora_down.weight", "up": ".lora_up.weight", "alpha": ".alpha"}[kind]
+        is_up = kind == "up"
         for prefix in ("diffusion_model.", "transformer."):
             if base.startswith(prefix):
                 base = base[len(prefix):]
@@ -129,6 +180,7 @@ def convert_peft_lora_to_native(lora_sd: dict, expected_shapes: Optional[dict] =
                 for name, part in zip(("to_q", "to_k", "to_v"), value.chunk(3, dim=0)):
                     converted[stem + name + suffix] = part.contiguous()
             else:
+                # shared down weight / alpha scalar apply verbatim to each split
                 for name in ("to_q", "to_k", "to_v"):
                     converted[stem + name + suffix] = value
         elif base.endswith(".attn.out_proj"):
@@ -162,6 +214,7 @@ def convert_peft_lora_to_native(lora_sd: dict, expected_shapes: Optional[dict] =
             ):
                 converted.pop(down_key, None)
                 converted.pop(up_key, None)
+                converted.pop(base + ".alpha", None)
                 dropped.append(base)
         if dropped:
             logger.warning(

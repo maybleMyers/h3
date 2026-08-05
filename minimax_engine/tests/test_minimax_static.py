@@ -127,39 +127,6 @@ def test_transformer_forward_shapes_and_output_format():
     torch.testing.assert_close(output.audio_sample, output_tuple[1])
 
 
-@torch.no_grad()
-def test_padding_rows_form_their_own_attention_document():
-    """A padding tail (tag -1) must leave the live rows' predictions untouched.
-
-    This exercises the boolean-mask path of the local attention dispatch, mirroring the
-    reference's `cu_seqlens = [0, used, S]` split.
-    """
-    torch.manual_seed(0)
-    model = MiniMaxH3Transformer3DModel(**TINY_CONFIG).eval()
-    inputs = _dummy_inputs()
-    padless = model(**inputs, return_dict=False)
-
-    num_padding_rows = 3
-    sequence_length = inputs["position_ids"].shape[0]
-    padded = dict(inputs)
-    padded["token_tags"] = torch.cat([inputs["token_tags"], torch.full((num_padding_rows,), -1, dtype=torch.long)])
-    padded["timestep_indices"] = torch.cat(
-        [inputs["timestep_indices"], torch.zeros(num_padding_rows, dtype=torch.long)]
-    )
-    padded["position_ids"] = torch.cat(
-        [
-            inputs["position_ids"],
-            torch.arange(sequence_length, sequence_length + num_padding_rows, dtype=torch.float32)[:, None].repeat(
-                1, 3
-            ),
-        ]
-    )
-    padded_out = model(**padded, return_dict=False)
-
-    for a, b in zip(padless, padded_out):
-        torch.testing.assert_close(a, b, atol=1e-5, rtol=1e-5)
-
-
 def test_block_swap_methods_exist():
     model = MiniMaxH3Transformer3DModel(**TINY_CONFIG)
     assert callable(model.enable_block_swap)

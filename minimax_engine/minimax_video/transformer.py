@@ -155,15 +155,22 @@ def _apply_gate_residual(
     return residual + gate.index_select(0, indices) * out
 
 
-def _adaln_input_dtype(linear: nn.Linear) -> torch.dtype:
-    # Under --fp8_scaled the projection weight is float8; casting the activation to it would hand
-    # F.linear two fp8 operands (the monkey patch dequantizes the weight back to the input dtype).
-    # Fall back to the bias dtype in that case — the bias is never quantized, so it carries the
-    # block stack's compute dtype. Otherwise match the weight as before.
-    dtype = linear.weight.dtype
-    if dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-        return linear.bias.dtype if linear.bias is not None else torch.bfloat16
-    return dtype
+_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+
+
+def _projection_input_dtype(module: nn.Module) -> torch.dtype:
+    # The dtype activations are cast to before entering `module`'s projection. Quantized layers keep
+    # `.weight` in a storage dtype — float8 under --fp8_scaled, int8 for ConvRot checkpoints — and
+    # dequantize inside their patched forward, so `weight.dtype` is not the compute dtype and casting
+    # activations to it would hand the matmul quantized operands (upstream hit the same with SDNQ:
+    # huggingface/diffusers#14398). The first regular floating-point parameter carries the compute
+    # dtype instead: the weight when unquantized, otherwise the never-quantized bias. A module with
+    # only quantized parameters dequantizes to the activation dtype, so the block stack's bfloat16
+    # is the right cast target there.
+    for param in module.parameters():
+        if param.is_floating_point() and param.dtype not in _FP8_DTYPES:
+            return param.dtype
+    return torch.bfloat16
 
 
 class MiniMaxH3AdaLayerNormModulation(nn.Module):
@@ -197,7 +204,7 @@ class MiniMaxH3AdaLayerNormModulation(nn.Module):
         # and their projection is float32: no activation, projection at full precision, result cast to `out_dtype`.
         if self.apply_silu:
             temb = nn.functional.silu(temb)
-        temb = self.linear(temb.to(_adaln_input_dtype(self.linear)))
+        temb = self.linear(temb.to(_projection_input_dtype(self.linear)))
         if out_dtype is not None and temb.dtype != out_dtype:
             # cast the six small modulation tables, not the [seq_len, hidden] tensors they modulate later
             temb = temb.to(out_dtype)
@@ -227,7 +234,7 @@ class MiniMaxH3AdaLayerNormOut(nn.Module):
         # (no activation for curve-form checkpoints, whose float32 projection result is cast down to the stream dtype).
         if self.apply_silu:
             temb = nn.functional.silu(temb)
-        shift, scale = self.linear(temb.to(_adaln_input_dtype(self.linear))).chunk(2, dim=-1)
+        shift, scale = self.linear(temb.to(_projection_input_dtype(self.linear))).chunk(2, dim=-1)
         if shift.dtype != hidden_states.dtype:
             shift, scale = shift.to(hidden_states.dtype), scale.to(hidden_states.dtype)
         # The modulation itself stays at the block stack's precision; `forward` casts to the output heads' dtype.
@@ -268,10 +275,9 @@ class MiniMaxH3AttnProcessor:
             query = _apply_rotary_emb_rows(query, *rotary_emb)
             key = _apply_rotary_emb_rows(key, *rotary_emb)
 
-        # Without padding rows the packed sequence is a single attention document and no mask is needed (passing an
-        # all-zero float mask here would hard-fail the flash / sage backends). When padding rows are present, the
-        # caller supplies a boolean mask that keeps them in their own attention document, mirroring the reference's
-        # `cu_seqlens = [0, used, S]` split; masked backends (SDPA & co.) are required in that case.
+        # MiniMax-H3 packs one request into a single attention document, so the model passes no mask and every
+        # attention backend stays available; `attention_mask` is here because it is the processor signature every
+        # other one has, and a custom processor may need it.
         hidden_states = dispatch_attention_fn(
             query,
             key,
@@ -496,10 +502,10 @@ class MiniMaxH3Transformer3DModel(AttentionMixin, ModelMixin, ConfigMixin):
     only from the two input patch projections, the per-row AdaLN modality tag, and the two output heads.
 
     The caller is responsible for building the packed layout: patchifying the video latents, ordering the rows, and
-    producing the `(t, h, w)` position grid, the per-row modality tags and the per-row timestep indices. Padding rows
-    (tag `-1`) are kept in a separate attention document, matching the reference implementation, which pads to a
-    multiple of 64 for FlashAttention with `cu_seqlens = [0, used, S]`. Prefer dropping them — a padless sequence
-    needs no attention mask, keeping the unmasked attention backends available.
+    producing the `(t, h, w)` position grid, the per-row modality tags and the per-row timestep indices. The sequence
+    carries no padding — the reference implementation pads it to a multiple of 64 for FlashAttention and splits the
+    tail off with `cu_seqlens = [0, used, S]`, which this port has no use for — so attention runs unmasked over one
+    document and every attention backend stays available.
 
     The batch axis is a pure replication axis: the structural arguments (`timestep`, `timestep_indices`, `token_tags`,
     `position_ids` and the three index tensors) describe one packed layout that every batch item shares, and each item
@@ -713,8 +719,7 @@ class MiniMaxH3Transformer3DModel(AttentionMixin, ModelMixin, ConfigMixin):
             timestep_indices (`torch.Tensor` of shape `(seq_len,)`):
                 For every row of the packed sequence, the index of its timestep in `timestep`.
             token_tags (`torch.Tensor` of shape `(seq_len,)`):
-                For every row of the packed sequence, its modality: `0` video, `1` text, `2` audio, `-1` padding.
-                Padding rows form their own attention document and never reach the outputs.
+                For every row of the packed sequence, its modality: `0` video, `1` text, `2` audio.
             position_ids (`torch.Tensor` of shape `(seq_len, 3)`):
                 The `(t, h, w)` rotary coordinates of every row of the packed sequence.
             video_indices (`torch.Tensor` of shape `(num_video_tokens,)`):
@@ -750,9 +755,9 @@ class MiniMaxH3Transformer3DModel(AttentionMixin, ModelMixin, ConfigMixin):
         # mixed-precision (the two patch projections are float32 while `context_embedder` and the block stack are
         # bfloat16 — see `_keep_in_fp32_modules`), so every input is aligned with its projection's parameter dtype,
         # mirroring the reference's explicit casts. The text stream sets the dtype of the packed sequence.
-        video_embeds = self.proj_in(hidden_states.to(self.proj_in.weight.dtype))
-        audio_embeds = self.audio_proj_in(audio_hidden_states.to(self.audio_proj_in.weight.dtype))
-        text_embeds = self.context_embedder(encoder_hidden_states.to(self.context_embedder.weight.dtype))
+        video_embeds = self.proj_in(hidden_states.to(_projection_input_dtype(self.proj_in)))
+        audio_embeds = self.audio_proj_in(audio_hidden_states.to(_projection_input_dtype(self.audio_proj_in)))
+        text_embeds = self.context_embedder(encoder_hidden_states.to(_projection_input_dtype(self.context_embedder)))
         text_embeds = self.token_refiner(text_embeds)
 
         hidden_states = text_embeds.new_zeros((text_embeds.shape[0], sequence_length, text_embeds.shape[-1]))
@@ -772,21 +777,10 @@ class MiniMaxH3Transformer3DModel(AttentionMixin, ModelMixin, ConfigMixin):
             temb = torch.lerp(table[i0], table[i0 + 1], (pos - i0.to(pos.dtype)).unsqueeze(1))
         else:
             temb = self.time_proj(timestep)
-            temb = self.time_embedder(temb.to(self.time_embedder.linear_1.weight.dtype))
+            temb = self.time_embedder(temb.to(_projection_input_dtype(self.time_embedder)))
 
-        # 3. Row -> AdaLN table row. `clamp(min=0)` mirrors the reference, where padding rows carry the tag `-1`; the
-        # clamp keeps the `-1` from indexing backwards (padding rows never reach the outputs, which are selected by
-        # `video_indices` / `audio_indices`).
-        adaln_indices = timestep_indices * MINIMAX_H3_MODALITY_NUM + token_tags.clamp(min=0)
-
-        # 4. Padding rows (tag `-1`) must not exchange attention with live rows: the reference keeps the padding tail
-        # as a separate attention document (`cu_seqlens = [0, used, S]`). A boolean mask that pairs live rows with live
-        # rows and padding rows with padding rows reproduces that split exactly. Padless sequences keep `None` so the
-        # unmasked fast paths (flash & co.) stay available.
-        attention_mask = None
-        is_pad = token_tags < 0
-        if bool(is_pad.any()):
-            attention_mask = is_pad[None, :] == is_pad[:, None]
+        # 3. Row -> AdaLN table row.
+        adaln_indices = timestep_indices * MINIMAX_H3_MODALITY_NUM + token_tags
 
         if self.blocks_to_swap:
             begin_forward = getattr(self.offloader, "begin_forward", None)
@@ -802,10 +796,10 @@ class MiniMaxH3Transformer3DModel(AttentionMixin, ModelMixin, ConfigMixin):
             SOL_CTX.current_block = block_idx
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 hidden_states = self._gradient_checkpointing_func(
-                    block, hidden_states, temb, adaln_indices, rotary_emb, attention_mask
+                    block, hidden_states, temb, adaln_indices, rotary_emb
                 )
             else:
-                hidden_states = block(hidden_states, temb, adaln_indices, rotary_emb, attention_mask)
+                hidden_states = block(hidden_states, temb, adaln_indices, rotary_emb)
 
             if self.blocks_to_swap:
                 self.offloader.submit_move_blocks_forward(self.transformer_blocks, block_idx)
@@ -816,14 +810,14 @@ class MiniMaxH3Transformer3DModel(AttentionMixin, ModelMixin, ConfigMixin):
         # align the activation with their parameter dtype.
         spans = _row_spans(sequence_length)
         if len(spans) == 1:
-            hidden_states = self.norm_out(hidden_states, temb, timestep_indices).to(self.proj_out.weight.dtype)
+            hidden_states = self.norm_out(hidden_states, temb, timestep_indices).to(_projection_input_dtype(self.proj_out))
             video_output = self.proj_out(hidden_states).index_select(1, video_indices)
             audio_output = self.audio_proj_out(hidden_states).index_select(1, audio_indices)
         else:
             # Row-sliced epilogue: norm_out and both heads are row-wise, so slicing gives the same
             # values while the full-sequence float32 cast never materializes — only the two small
             # head outputs do (out_features 96 and 32 vs hidden_size 5376).
-            head_dtype = self.proj_out.weight.dtype
+            head_dtype = _projection_input_dtype(self.proj_out)
             batch_size = hidden_states.shape[0]
             video_full = torch.empty(
                 (batch_size, sequence_length, self.proj_out.out_features), dtype=head_dtype, device=hidden_states.device
