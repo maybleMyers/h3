@@ -514,7 +514,7 @@ class MiniMaxH3AudioBigVGANDecoder(nn.Module):
         return torch.clamp(hidden_states, min=-1.0, max=1.0)
 
 
-class AutoencoderKLMiniMaxH3Audio(ModelMixin, ConfigMixin, AttentionMixin):
+class AutoencoderKLMiniMaxH3Audio(AttentionMixin, ModelMixin, ConfigMixin):
     r"""
     The audio autoencoder used by [MiniMax-H3](https://huggingface.co/MiniMaxAI): a DAC-lineage
     convolutional encoder and a BigVGAN decoder, operating directly on mono 32 kHz waveforms.

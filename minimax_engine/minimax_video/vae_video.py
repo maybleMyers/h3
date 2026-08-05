@@ -525,7 +525,7 @@ class MiniMaxH3VideoViTDecoder3d(nn.Module):
         )
 
 
-class AutoencoderKLMiniMaxH3(ModelMixin, ConfigMixin, AttentionMixin, AutoencoderMixin):
+class AutoencoderKLMiniMaxH3(AttentionMixin, ModelMixin, ConfigMixin, AutoencoderMixin):
     r"""
     A VAE model with a causal 3D CNN encoder and a non-causal ViT decoder, used in
     [MiniMax-H3](https://huggingface.co/MiniMaxAI).

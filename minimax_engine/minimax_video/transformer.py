@@ -486,7 +486,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
         return hidden_states
 
 
-class MiniMaxH3Transformer3DModel(ModelMixin, ConfigMixin, AttentionMixin):
+class MiniMaxH3Transformer3DModel(AttentionMixin, ModelMixin, ConfigMixin):
     r"""
     A Transformer model for joint video + audio generation, introduced in MiniMax-H3.
 
