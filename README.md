@@ -27,6 +27,8 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 pip install -r requirements.txt
 ```
 
+Install torch, torchvision, and torchaudio **together** in the first step so pip picks one matched set from the CUDA index. `requirements.txt` only sets minimum versions for them, so a torch stack you already have installed is respected and left untouched.
+
 `ffmpeg` and `ffprobe` must be on your PATH (metadata embedding and the Video Info tab use them). Optional performance extras: `flash-attn`, `sageattention`, `xformers` (selectable as Attention Mode in the UI), and `spandrel` for the ESRGAN/SwinIR upscalers.
 
 ## Downloading the MiniMax-H3 model

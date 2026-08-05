@@ -1,0 +1,50 @@
+[project]
+name = "h3"
+version = "0.1.0"
+description = "Standalone MiniMax-H3 video generation GUI (MiniMax / Frame Interpolation / Video Info)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    # Core GUI
+    "gradio==5.14.0",
+    # pydantic >=2.11 emits bool JSON schemas that gradio 5.14's client cannot parse
+    "pydantic==2.10.6",
+    "tiktoken",
+    "pillow",
+    "opencv-python",
+    "imageio-ffmpeg",
+    # MiniMax-H3 engine (minimax_engine/)
+    "torch>=2.5.1",
+    "torchvision>=0.20.1",
+    "torchaudio>=2.5.1",
+    "numpy",
+    "tqdm",
+    "safetensors",
+    "einops",
+    "transformers",
+    "accelerate",
+    "diffusers",
+    "av",
+    "rich",
+    # Frame interpolation / upscaling (GIMM-VFI, BiM-VFI, ESRGAN/SwinIR/BasicVSR++)
+    "huggingface_hub",
+    "omegaconf",
+    "easydict",
+]
+
+[project.optional-dependencies]
+upscalers = ["spandrel"]
+
+[tool.uv]
+# Plain script project: nothing to build or install, uv just manages the environment.
+package = false
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128" }]
+torchvision = [{ index = "pytorch-cu128" }]
+torchaudio = [{ index = "pytorch-cu128" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

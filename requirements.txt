@@ -1,14 +1,19 @@
+# cu128 wheels are reachable for fresh installs; an already-installed torch stack
+# satisfies the floors below and is left untouched.
+--extra-index-url https://download.pytorch.org/whl/cu128
+
 # Core GUI
 gradio==5.14.0
+pydantic==2.10.6   # pydantic >=2.11 emits bool JSON schemas that gradio 5.14 cannot parse
 tiktoken
 pillow
 opencv-python
 imageio-ffmpeg
 
 # MiniMax-H3 engine (minimax_engine/)
-torch
-torchvision
-torchaudio
+torch>=2.5.1
+torchvision>=0.20.1
+torchaudio>=2.5.1
 numpy
 tqdm
 safetensors
