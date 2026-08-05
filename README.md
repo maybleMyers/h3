@@ -8,10 +8,22 @@ A standalone Gradio interface for [MiniMax-H3](https://huggingface.co/MiniMaxAI/
 
 ## Installation
 
+### Option A: uv (recommended)
+
+With [uv](https://docs.astral.sh/uv/) installed, there is no setup step — the first run resolves and installs everything from `pyproject.toml` (torch comes from the cu128 PyTorch index) into a local `.venv`:
+
+```bash
+uv run h3.py
+```
+
+Optional ESRGAN/SwinIR upscaler support: `uv sync --extra upscalers`.
+
+### Option B: venv + pip
+
 ```bash
 python -m venv env
 source env/bin/activate        # Windows: env\Scripts\activate
-pip install torch --index-url https://download.pytorch.org/whl/cu128   # match your CUDA
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128   # match your CUDA
 pip install -r requirements.txt
 ```
 
@@ -45,7 +57,7 @@ minimax_engine/convert_minimax_h3.sh /path/to/MiniMax-H3 /path/to/MiniMax-H3-dif
 
 - Needs **~135 GB free** at the output path.
 - The Qwen3-VL components are **symlinked** from the source by default. Add `--copy-shared` (+~63 GB) if the output dir will be moved to another filesystem afterwards.
-- The script uses `env/bin/python` from this repo if present, otherwise `python3`; override with `PYTHON=/path/to/python minimax_engine/convert_minimax_h3.sh ...`.
+- The script uses `env/bin/python` from this repo if present, otherwise `python3`; override with `PYTHON=/path/to/python minimax_engine/convert_minimax_h3.sh ...` — with uv, use `PYTHON=.venv/bin/python` (run `uv sync` once first).
 - It finishes with a self-verification step and prints the directory to point the GUI at.
 
 Resulting layout:
@@ -102,6 +114,8 @@ Nothing to set up: checkpoints (GIMM-VFI variants, BiM-VFI, RAFT/FlowFormer aux,
 ## Running
 
 ```bash
+uv run h3.py          # uv
+# or, with an activated venv:
 python h3.py
 ```
 

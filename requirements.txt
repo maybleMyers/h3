@@ -1,5 +1,5 @@
 # Core GUI
-gradio
+gradio==5.14.0
 tiktoken
 pillow
 opencv-python
@@ -7,6 +7,8 @@ imageio-ffmpeg
 
 # MiniMax-H3 engine (minimax_engine/)
 torch
+torchvision
+torchaudio
 numpy
 tqdm
 safetensors
