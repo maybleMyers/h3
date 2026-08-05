@@ -91,6 +91,10 @@ The **DiT Override** and **Text Encoder Override** fields accept single-file exp
 - **Blocks to Swap** (0–49) streams transformer blocks between CPU and GPU.
 - **Text Encoder GPU Layers** / streaming control how much of the ~30B conditioner sits on the GPU; **Prompt Cache** skips the conditioner load entirely on repeat runs with identical inputs.
 
+## Latent previews
+
+The MiniMax tab can show in-progress previews every N steps. Blank **Preview TAE Checkpoint** = fast latent2rgb previews. For full-resolution TAE previews, enter a path like `weights/taeh3.safetensors` — known [madebyollin/taehv](https://github.com/madebyollin/taehv) checkpoints are downloaded automatically if the file is missing.
+
 ## Frame interpolation weights
 
 Nothing to set up: checkpoints (GIMM-VFI variants, BiM-VFI, RAFT/FlowFormer aux, RealESRGAN, SwinIR, BasicVSR++) download automatically from [maybleMyers/interpolate](https://huggingface.co/maybleMyers/interpolate) into `weights/` on first use.
