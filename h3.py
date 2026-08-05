@@ -283,6 +283,44 @@ def minimax_order_references(files, order_text: str):
     return [paths[i] for i in indexes]
 
 
+MINIMAX_TAEHV_DEFAULT = os.path.join("weights", "taeh3.safetensors")
+_TAEHV_RAW_BASE = "https://raw.githubusercontent.com/madebyollin/taehv/main"
+
+
+def minimax_ensure_taehv_checkpoint(path: str) -> str:
+    """Return `path`, downloading it from madebyollin/taehv first when it does not exist.
+
+    Mirrors blissful_tuner.latent_preview.ensure_taehv_checkpoint (not imported here: that module
+    pulls in torch, which the UI process avoids). Only `tae*.safetensors` names are attempted;
+    the download goes to a temp file and is renamed into place so an interrupted fetch never
+    leaves a truncated checkpoint behind.
+    """
+    if os.path.exists(path):
+        return path
+    name = os.path.basename(path)
+    if not (name.startswith("tae") and name.endswith(".safetensors")):
+        raise gr.Error(f"TAEHV preview checkpoint {path} was not found (only tae*.safetensors "
+                       f"names can be auto-downloaded)")
+    url = f"{_TAEHV_RAW_BASE}/safetensors/{name}"
+    print(f"{path} not found — downloading {name} from {url}")
+    import urllib.request
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp_path = path + ".download"
+    try:
+        urllib.request.urlretrieve(url, tmp_path)
+        os.replace(tmp_path, path)
+    except Exception as e:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise gr.Error(f"TAEHV auto-download from {url} failed: {e}")
+    print(f"Saved {path} ({os.path.getsize(path) / 1e6:.1f} MB)")
+    return path
+
+
 def minimax_submit_to_queue(
     prompt: str,
     task_override: str,
@@ -302,6 +340,7 @@ def minimax_submit_to_queue(
     batch_size: int,
     save_path: str,
     enable_preview: bool,
+    use_taehv: bool,
     preview_steps: int,
     preview_vae: str,
     # Model Paths
@@ -405,6 +444,13 @@ def minimax_submit_to_queue(
     else:
         width = height = None
 
+    # TAEHV previews: resolve + download the checkpoint up front so generation never waits on
+    # (or fails over) a network fetch mid-run.
+    taehv_path = None
+    if enable_preview and use_taehv:
+        taehv_path = str(preview_vae or "").strip() or MINIMAX_TAEHV_DEFAULT
+        minimax_ensure_taehv_checkpoint(taehv_path)
+
     for i in range(batch_count):
         current_seed = base_seed
         if base_seed == -1:
@@ -496,8 +542,8 @@ def minimax_submit_to_queue(
         if enable_preview:
             command.extend(["--preview", str(max(1, int(preview_steps)))])
             command.extend(["--preview_suffix", unique_preview_suffix])
-            if preview_vae and str(preview_vae).strip():
-                command.extend(["--preview_vae", str(preview_vae).strip()])
+            if taehv_path:
+                command.extend(["--preview_vae", taehv_path])
 
         # LoRA handling (shared lora folder listing, same as the Cosmos tab)
         lora_weights_paths = []
@@ -1319,14 +1365,20 @@ with gr.Blocks(
                         show_label=True, elem_id="gallery_minimax", allow_preview=True, preview=True,
                     )
                     with gr.Accordion("Latent Preview (During Generation)", open=True):
-                        minimax_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
+                        with gr.Row():
+                            minimax_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
+                            minimax_use_taehv = gr.Checkbox(
+                                label="Use TAEHV Previews", value=False,
+                                info="full-resolution TAE previews (taeh3.safetensors, auto-downloaded "
+                                     "before generation starts); off = fast latent2rgb",
+                            )
                         minimax_preview_steps = gr.Slider(minimum=1, maximum=50, step=1, value=5,
                                                           label="Preview Every N Steps")
                         minimax_preview_vae = gr.Textbox(
                             label="Preview TAE Checkpoint (optional)", value="",
-                            info="blank = fast latent2rgb preview; a path like weights/taeh3.safetensors enables "
-                                 "full-resolution TAE previews — known madebyollin/taehv checkpoints are "
-                                 "downloaded automatically if the file is missing",
+                            info="custom checkpoint path used when 'Use TAEHV Previews' is checked; "
+                                 "blank = weights/taeh3.safetensors (known madebyollin/taehv checkpoints "
+                                 "are downloaded automatically if the file is missing)",
                         )
                         minimax_preview_output = gr.Gallery(
                             label="Latent Previews", columns=4, rows=2, object_fit="contain", height=300,
@@ -1751,6 +1803,7 @@ with gr.Blocks(
             minimax_batch_size,
             minimax_save_path,
             minimax_enable_preview,
+            minimax_use_taehv,
             minimax_preview_steps,
             minimax_preview_vae,
             # Model Paths
@@ -1959,6 +2012,7 @@ with gr.Blocks(
         minimax_num_outputs,
         minimax_prompt_cache,
         minimax_enable_preview,
+        minimax_use_taehv,
         minimax_preview_steps,
         minimax_preview_vae,
     ] + minimax_lora_weights + minimax_lora_multipliers
@@ -1996,6 +2050,7 @@ with gr.Blocks(
         "minimax_num_outputs",
         "minimax_prompt_cache",
         "minimax_enable_preview",
+        "minimax_use_taehv",
         "minimax_preview_steps",
         "minimax_preview_vae",
     ] + [f"minimax_lora_weight_{i+1}" for i in range(4)] + \
