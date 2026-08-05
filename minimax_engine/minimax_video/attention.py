@@ -14,7 +14,7 @@ import torch.nn.functional as F
 
 from .compile_config import maybe_compile
 
-_VALID_BACKENDS = ("torch", "sdpa", "flash", "flashattn", "flash2", "flash3", "sageattn", "xformers")
+_VALID_BACKENDS = ("torch", "sdpa", "flash", "flashattn", "flash2", "flash3", "sageattn", "xformers", "sol")
 
 # Module-level default backend, used when dispatch_attention_fn is called with backend=None.
 _ATTENTION_BACKEND = "torch"
@@ -118,6 +118,64 @@ def _sage_attention(query, key, value, dropout_p, is_causal, enable_gqa):
     return out.transpose(1, 2)
 
 
+_SOL_WARNED: set[str] = set()
+
+
+def _sol_warn_once(reason: str) -> None:
+    if reason not in _SOL_WARNED:
+        _SOL_WARNED.add(reason)
+        print(f"[sol-attn] running dense SDPA: {reason}", flush=True)
+
+
+def _sol_attention(query, key, value, attn_mask, dropout_p, is_causal, enable_gqa):
+    """Sol-Attn (NVIDIA block-sparse attention) with the H3 recipe gates.
+
+    Falls back to SDPA whenever the sparse kernel should not or cannot run. Recipe fallbacks
+    (dense warmup steps / first blocks) are silent and expected; capability fallbacks warn once
+    per reason and raise instead when SOL_CTX.strict is set.
+    """
+    from .sol_attn import SOL_CTX, is_sol_available
+
+    ctx = SOL_CTX
+    # Recipe gates: first N steps and first N blocks stay dense. current_step/current_block of -1
+    # (token refiner blocks, or a caller outside the denoise loop) also lands here.
+    if ctx.current_step < ctx.dense_steps or ctx.current_block < ctx.dense_blocks:
+        ctx.stats["dense_recipe"] += 1
+        return _sdpa_attention(query, key, value, attn_mask, dropout_p, is_causal, enable_gqa)
+
+    # Capability gates: conditions under which the kernel contract is not met.
+    reason = None
+    if attn_mask is not None:
+        reason = "attn_mask present (padded sequence)"
+    elif is_causal or dropout_p != 0.0:
+        reason = "causal or dropout attention is unsupported"
+    elif query.shape != key.shape or query.shape != value.shape:
+        reason = "q/k/v shapes differ (GQA is unsupported)"
+    elif query.shape[-1] != 128:
+        reason = f"head_dim {query.shape[-1]} != 128"
+    elif query.dtype != torch.bfloat16:
+        reason = f"dtype {query.dtype} is not bfloat16"
+    elif query.shape[1] < ctx.min_tokens:
+        reason = f"sequence length {query.shape[1]} < min_tokens {ctx.min_tokens}"
+    else:
+        ok, why = is_sol_available()
+        if not ok:
+            reason = why
+    if reason is not None:
+        # min_tokens and attn_mask are legitimate configuration outcomes, not environment
+        # failures, so they never raise even in strict mode.
+        if ctx.strict and "min_tokens" not in reason and "attn_mask" not in reason:
+            raise RuntimeError(f"--sol_strict: sol-attn fell back to SDPA: {reason}")
+        _sol_warn_once(reason)
+        ctx.stats["dense_fallback"] += 1
+        return _sdpa_attention(query, key, value, attn_mask, dropout_p, is_causal, enable_gqa)
+
+    from .sol_attn import sol_attention
+
+    ctx.stats["sparse"] += 1
+    return sol_attention(query, key, value, tau=ctx.tau, sink_len=ctx.sink_len)
+
+
 def _xformers_attention(query, key, value, dropout_p, is_causal):
     try:
         import xformers.ops as xops
@@ -156,6 +214,11 @@ def dispatch_attention_fn(
 
     if backend in ("torch", "sdpa"):
         return _sdpa_attention(query, key, value, attn_mask, dropout_p, is_causal, enable_gqa)
+
+    # "sol" handles attn_mask itself (by falling back to SDPA), so it dispatches before the
+    # mask hard-error below.
+    if backend == "sol":
+        return _sol_attention(query, key, value, attn_mask, dropout_p, is_causal, enable_gqa)
 
     if attn_mask is not None:
         raise ValueError(f"Attention backend {backend!r} does not support an explicit attn_mask.")

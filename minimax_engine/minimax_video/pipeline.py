@@ -66,6 +66,7 @@ from .packing_ref2va import (
     resolve_reference_image_size,
     trim_reference_num_frames,
 )
+from .sol_attn.context import SOL_CTX
 
 logger = logging.getLogger(__name__)
 
@@ -507,36 +508,49 @@ class MiniMaxH3Pipeline:
         num_condition_audio_rows = layout.num_condition_audio_rows
         prompt_embeds = prompt_embeds.to(device)
 
+        # Sol-Attn layout/state: the exact-KV sink is every row before the target-video tail
+        # (text + condition video + audio). Plain attribute writes; inert on dense backends.
+        SOL_CTX.sink_len = (
+            int(video_indices[num_condition_video_rows].item())
+            if num_condition_video_rows < video_indices.numel()
+            else 0
+        )
+        SOL_CTX.reset_stats()
+
         total = len(timesteps)
-        for i, t in enumerate(timesteps):
-            unique_timesteps, timestep_indices = row_timestep_plan[i]
-            noise_pred, audio_noise_pred = self.transformer(
-                hidden_states=latents[None],
-                audio_hidden_states=audio_latents[None],
-                encoder_hidden_states=prompt_embeds,
-                timestep=unique_timesteps,
-                timestep_indices=timestep_indices,
-                token_tags=token_tags,
-                position_ids=position_ids,
-                video_indices=video_indices,
-                audio_indices=audio_indices,
-                text_indices=text_indices,
-                return_dict=False,
-            )
-            latents[num_condition_video_rows:] = self.scheduler.step(
-                noise_pred[0, num_condition_video_rows:].float(),
-                t,
-                latents[num_condition_video_rows:],
-                return_dict=False,
-            )[0]
-            audio_latents[num_condition_audio_rows:] = self.audio_scheduler.step(
-                audio_noise_pred[0, num_condition_audio_rows:].float(),
-                audio_timesteps[i],
-                audio_latents[num_condition_audio_rows:],
-                return_dict=False,
-            )[0]
-            if step_callback is not None:
-                step_callback(i, total, latents, audio_latents, noise_pred)
+        try:
+            for i, t in enumerate(timesteps):
+                SOL_CTX.current_step = i
+                unique_timesteps, timestep_indices = row_timestep_plan[i]
+                noise_pred, audio_noise_pred = self.transformer(
+                    hidden_states=latents[None],
+                    audio_hidden_states=audio_latents[None],
+                    encoder_hidden_states=prompt_embeds,
+                    timestep=unique_timesteps,
+                    timestep_indices=timestep_indices,
+                    token_tags=token_tags,
+                    position_ids=position_ids,
+                    video_indices=video_indices,
+                    audio_indices=audio_indices,
+                    text_indices=text_indices,
+                    return_dict=False,
+                )
+                latents[num_condition_video_rows:] = self.scheduler.step(
+                    noise_pred[0, num_condition_video_rows:].float(),
+                    t,
+                    latents[num_condition_video_rows:],
+                    return_dict=False,
+                )[0]
+                audio_latents[num_condition_audio_rows:] = self.audio_scheduler.step(
+                    audio_noise_pred[0, num_condition_audio_rows:].float(),
+                    audio_timesteps[i],
+                    audio_latents[num_condition_audio_rows:],
+                    return_dict=False,
+                )[0]
+                if step_callback is not None:
+                    step_callback(i, total, latents, audio_latents, noise_pred)
+        finally:
+            SOL_CTX.current_step = -1
         return latents, audio_latents
 
     # ------------------------------------------------------------------ decode

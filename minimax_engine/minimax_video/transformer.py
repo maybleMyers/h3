@@ -34,6 +34,7 @@ from diffusers.models.modeling_utils import ModelMixin
 
 from .attention import AttentionMixin, AttentionModuleMixin, dispatch_attention_fn
 from .compile_config import maybe_compile
+from .sol_attn.context import SOL_CTX
 
 
 logger = logging.getLogger(__name__)
@@ -798,6 +799,7 @@ class MiniMaxH3Transformer3DModel(ModelMixin, ConfigMixin, AttentionMixin):
             if self.blocks_to_swap:
                 self.offloader.wait_for_block(block_idx)
 
+            SOL_CTX.current_block = block_idx
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 hidden_states = self._gradient_checkpointing_func(
                     block, hidden_states, temb, adaln_indices, rotary_emb, attention_mask
@@ -807,6 +809,7 @@ class MiniMaxH3Transformer3DModel(ModelMixin, ConfigMixin, AttentionMixin):
 
             if self.blocks_to_swap:
                 self.offloader.submit_move_blocks_forward(self.transformer_blocks, block_idx)
+        SOL_CTX.current_block = -1
 
         # 5. Both heads run over every row, then the rows of each modality are selected. The heads are listed in
         # `_keep_in_fp32_modules`, so they stay float32 while the block stack runs in the requested `torch_dtype`;

@@ -315,6 +315,7 @@ def minimax_submit_to_queue(
     prompt_cache: bool,
     # Performance
     attn_mode: str,
+    sol_tau: float,
     blocks_to_swap: int,
     classic_block_swap: bool,
     act_chunk_rows,
@@ -442,6 +443,9 @@ def minimax_submit_to_queue(
         if current_seed >= 0:
             command.extend(["--seed", str(current_seed)])
 
+        if attn_mode == "sol":
+            command.extend(["--sol_tau", str(float(sol_tau) if sol_tau is not None else 1.0)])
+
         if input_image:
             command.extend(["--image_path", str(input_image)])
         if last_image:
@@ -529,6 +533,7 @@ def minimax_submit_to_queue(
             "num_outputs": num_outputs,
             "ckpt_dir": ckpt_dir,
             "attn_mode": attn_mode,
+            "sol_tau": sol_tau,
             "blocks_to_swap": blocks_to_swap,
             "compile": compile_enabled,
             "save_path": save_path,
@@ -1366,8 +1371,17 @@ with gr.Blocks(
                 with gr.Row():
                     minimax_attn_mode = gr.Dropdown(
                         label="Attention Mode",
-                        choices=["torch", "sdpa", "flash", "flashattn", "flash2", "flash3", "sageattn", "xformers"],
+                        choices=["torch", "sdpa", "flash", "flashattn", "flash2", "flash3", "sageattn", "xformers",
+                                 "sol"],
                         value="sdpa",
+                        info="'sol' = NVIDIA Sol-Attn block-sparse attention (training-free, DiT only; "
+                             "needs triton + SM80+)",
+                    )
+                    minimax_sol_tau = gr.Slider(
+                        minimum=0.8, maximum=1.25, step=0.01, value=1.0,
+                        label="Sol-Attn tau",
+                        info="routing threshold scale, only used when Attention Mode is 'sol'; "
+                             "higher = sparser/faster, lower = denser/safer",
                     )
                     minimax_blocks_to_swap = gr.Slider(
                         minimum=0, maximum=49, step=1,
@@ -1750,6 +1764,7 @@ with gr.Blocks(
             minimax_prompt_cache,
             # Performance
             minimax_attn_mode,
+            minimax_sol_tau,
             minimax_blocks_to_swap,
             minimax_classic_block_swap,
             minimax_act_chunk_rows,
@@ -1918,6 +1933,7 @@ with gr.Blocks(
         minimax_audio_vae_path,
         minimax_text_encoder_path,
         minimax_attn_mode,
+        minimax_sol_tau,
         minimax_blocks_to_swap,
         minimax_classic_block_swap,
         minimax_act_chunk_rows,
@@ -1954,6 +1970,7 @@ with gr.Blocks(
         "minimax_audio_vae_path",
         "minimax_text_encoder_path",
         "minimax_attn_mode",
+        "minimax_sol_tau",
         "minimax_blocks_to_swap",
         "minimax_classic_block_swap",
         "minimax_act_chunk_rows",
@@ -2190,7 +2207,7 @@ with gr.Blocks(
         attn = params.get("attn_mode")
         attn_update = (gr.update(value=attn)
                        if attn in ("torch", "sdpa", "flash", "flashattn", "flash2",
-                                   "flash3", "sageattn", "xformers")
+                                   "flash3", "sageattn", "xformers", "sol")
                        else gr.update())
 
         reference_order = " ".join(str(i + 1) for i in range(len(references)))
@@ -2215,6 +2232,7 @@ with gr.Blocks(
             opt("num_outputs", int),                          # minimax_num_outputs
             opt("ckpt_dir", str),                             # minimax_ckpt_dir
             attn_update,                                      # minimax_attn_mode
+            opt("sol_tau", float),                            # minimax_sol_tau
             opt("blocks_to_swap", int),                       # minimax_blocks_to_swap
             opt("compile", bool),                             # minimax_compile
             opt("save_path", str),                            # minimax_save_path
@@ -2234,7 +2252,7 @@ with gr.Blocks(
             minimax_aspect_ratio, minimax_width, minimax_height, minimax_video_length,
             minimax_infer_steps, minimax_flow_shift, minimax_audio_flow_shift,
             minimax_seed, minimax_num_outputs, minimax_ckpt_dir, minimax_attn_mode,
-            minimax_blocks_to_swap, minimax_compile, minimax_save_path,
+            minimax_sol_tau, minimax_blocks_to_swap, minimax_compile, minimax_save_path,
         ],
     ).then(
         fn=change_to_minimax_tab,

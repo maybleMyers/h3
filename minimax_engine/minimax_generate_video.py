@@ -103,7 +103,19 @@ def parse_args() -> argparse.Namespace:
     # Performance
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--attn_mode", type=str, default="sdpa",
-                        choices=["torch", "sdpa", "flash", "flashattn", "flash2", "flash3", "sageattn", "xformers"])
+                        choices=["torch", "sdpa", "flash", "flashattn", "flash2", "flash3", "sageattn", "xformers",
+                                 "sol"])
+    parser.add_argument("--sol_tau", type=float, default=1.0,
+                        help="Sol-Attn routing threshold scale (tau_i = mu_i + tau*sigma_i); useful range 0.8-1.25, "
+                             "lower = denser/safer")
+    parser.add_argument("--sol_dense_steps", type=int, default=10,
+                        help="run the first N denoising steps fully dense (NVIDIA H3 recipe: 10)")
+    parser.add_argument("--sol_dense_blocks", type=int, default=2,
+                        help="run the first N transformer blocks of every step fully dense (NVIDIA H3 recipe: 2)")
+    parser.add_argument("--sol_min_tokens", type=int, default=4096,
+                        help="fall back to dense attention below this packed sequence length")
+    parser.add_argument("--sol_strict", action="store_true",
+                        help="raise instead of silently falling back to dense when the sol kernel cannot engage")
     parser.add_argument("--compile", action="store_true",
                         help="Enable torch.compile with function-level decorators (mode: max-autotune-no-cudagraphs, "
                              "dynamic: True). Compatible with all dtypes and block swap; first run is slower while "
@@ -328,7 +340,9 @@ def load_transformer_stage(args, task, device):
     from minimax_video import transformer as minimax_transformer
     from minimax_video.model_loader import load_transformer
 
-    minimax_attention.set_attention_backend(args.attn_mode)
+    # "sol" is scoped to the DiT only (set per-processor after load); the module-level default
+    # also serves the video/audio VAEs, which stay on SDPA.
+    minimax_attention.set_attention_backend("sdpa" if args.attn_mode == "sol" else args.attn_mode)
     minimax_transformer.set_act_chunk_rows(args.act_chunk_rows)
     if args.act_chunk_rows:
         logger.info(f"row-chunked activations enabled: {args.act_chunk_rows} rows per slice")
@@ -380,6 +394,25 @@ def load_transformer_stage(args, task, device):
         dit_path=args.dit,
         int8_use_int_mm=args.int8_fast,
     )
+    if args.attn_mode == "sol":
+        from minimax_video.sol_attn import SOL_CTX, is_sol_available
+
+        SOL_CTX.tau = args.sol_tau
+        SOL_CTX.dense_steps = args.sol_dense_steps
+        SOL_CTX.dense_blocks = args.sol_dense_blocks
+        SOL_CTX.min_tokens = args.sol_min_tokens
+        SOL_CTX.strict = args.sol_strict
+        transformer.set_attention_backend("sol")
+        ok, why = is_sol_available()
+        if not ok:
+            if args.sol_strict:
+                raise RuntimeError(f"--attn_mode sol with --sol_strict, but the kernel is unavailable: {why}")
+            logger.warning(f"sol-attn unavailable ({why}); the DiT will run dense SDPA")
+        else:
+            logger.info(
+                f"sol-attn enabled: tau={args.sol_tau}, dense_steps={args.sol_dense_steps}, "
+                f"dense_blocks={args.sol_dense_blocks}, min_tokens={args.sol_min_tokens}"
+            )
     if args.blocks_to_swap and args.blocks_to_swap > 0:
         transformer.enable_block_swap(
             args.blocks_to_swap, device, supports_backward=False, streaming=not args.classic_block_swap
@@ -688,6 +721,21 @@ def run_one(args, task, device, seed):
         logger.info("stop requested: decoding the current state")
     finally:
         progress_bar.close()
+
+    if args.attn_mode == "sol":
+        from minimax_video.sol_attn import SOL_CTX
+
+        logger.info(f"sol-attn attention calls: {SOL_CTX.stats}")
+        if (
+            args.sol_strict
+            and not stopped_early
+            and len(timesteps) > args.sol_dense_steps  # a run that is all warmup is dense by design
+            and SOL_CTX.stats["sparse"] == 0
+        ):
+            raise RuntimeError(
+                f"--sol_strict: the denoise loop finished without a single sparse attention call "
+                f"(stats: {SOL_CTX.stats})"
+            )
 
     del transformer
     pipe.transformer = None

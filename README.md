@@ -33,6 +33,8 @@ Install torch, torchvision, and torchaudio **together** in the first step so pip
 
 `ffmpeg` and `ffprobe` must be on your PATH (metadata embedding and the Video Info tab use them). Optional performance extras: `flash-attn`, `sageattention`, `xformers` (selectable as Attention Mode in the UI), and `spandrel` for the ESRGAN/SwinIR upscalers.
 
+The `sol` Attention Mode (NVIDIA Sol-Attn block-sparse attention, vendored from the [Sana `sol-engine` branch](https://github.com/NVlabs/Sana/tree/sol-engine), Apache-2.0) needs no extra install: it uses the `triton` that ships with torch (>= 3.4 verified) and an SM80+ GPU. It sparsifies the DiT's self-attention at inference time (training-free); the first ~10 denoising steps, the first 2 transformer blocks, and the text/condition/audio prefix stay exact per NVIDIA's MiniMax-H3 recipe, tunable via `--sol_tau` / `--sol_dense_steps` / `--sol_dense_blocks` (`--sol_strict` fails loudly if the kernel cannot engage).
+
 ## Downloading the MiniMax-H3 model
 
 The engine loads a **diffusers-layout** checkpoint directory. You download the original MiniMax release and convert it once with the included script.
