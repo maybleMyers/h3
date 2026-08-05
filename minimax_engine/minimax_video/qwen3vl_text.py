@@ -157,6 +157,116 @@ class Qwen3VLTextDecoderLayer(nn.Module):
         return residual + hidden_states
 
 
+class _StreamSlot:
+    """One reusable GPU buffer holding a single decoder layer's tensors during streaming."""
+
+    def __init__(self):
+        self.tensors: list[torch.Tensor] | None = None
+        self.ready = torch.cuda.Event()  # upload finished (recorded on the copy stream)
+        self.free = torch.cuda.Event()  # last compute out of this slot finished (recorded on the compute stream)
+
+
+class _LayerStreamer:
+    """Double-buffered CUDA prefetcher for CPU-resident decoder layers.
+
+    The CPU weights are the permanent masters, moved into pinned memory on first use so
+    host-to-device copies can run asynchronously (pinning falls back to pageable memory
+    if the allocation fails; streaming still works, just without overlap). Two GPU slots
+    alternate: while layer N computes out of one slot on the current stream, layer N+1
+    uploads into the other on a side copy stream. Weights are read-only during the
+    forward, so nothing is ever copied back to the CPU.
+
+    Slot memory (two layers, ~2 GB for the bf16 conditioner) is released at the end of
+    every forward; the pinned CPU masters persist so repeat encodes skip the pinning
+    cost. Layers whose tensor layout differs from the first streamed layer (never the
+    case for a real checkpoint) fall back to the synchronous `.to()` path.
+    """
+
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.copy_stream = torch.cuda.Stream(device=device)
+        self.slots = (_StreamSlot(), _StreamSlot())
+        self._pin_ok = True
+        self._signature = None
+        self._owners: dict[int, list[torch.Tensor]] = {}  # layer_idx -> param/buffer objects
+        self._masters: dict[int, list[torch.Tensor]] = {}  # layer_idx -> their CPU (pinned) data
+        self._skip: set[int] = set()
+        self._active: dict[int, _StreamSlot] = {}  # uploaded (or uploading) layers
+        self._pending: list[int] = []
+
+    def _pin(self, owners: list[torch.Tensor]) -> None:
+        for t in owners:
+            if not self._pin_ok or t.data.is_pinned():
+                continue
+            try:
+                pinned = torch.empty_like(t.data, pin_memory=True)
+                pinned.copy_(t.data)
+                t.data = pinned
+            except RuntimeError:
+                self._pin_ok = False
+
+    def begin(self, layers: nn.ModuleList, streamed: list[int]) -> None:
+        for idx in streamed:
+            if idx in self._owners or idx in self._skip:
+                continue
+            owners = [p for _, p in layers[idx].named_parameters()] + [b for _, b in layers[idx].named_buffers()]
+            signature = tuple((tuple(t.shape), t.dtype) for t in owners)
+            if self._signature is None:
+                self._signature = signature
+            if signature != self._signature:
+                self._skip.add(idx)
+                continue
+            self._pin(owners)
+            self._owners[idx] = owners
+            self._masters[idx] = [t.data for t in owners]
+        self._pending = [i for i in streamed if i in self._owners]
+        for slot in self.slots:
+            if self._pending:
+                self._upload(self._pending.pop(0), slot)
+
+    def _upload(self, idx: int, slot: _StreamSlot) -> None:
+        masters = self._masters[idx]
+        if slot.tensors is None:
+            slot.tensors = [torch.empty_like(t, device=self.device) for t in masters]
+        self.copy_stream.wait_event(slot.free)
+        with torch.cuda.stream(self.copy_stream):
+            for dst, src in zip(slot.tensors, masters):
+                dst.copy_(src, non_blocking=True)
+        slot.ready.record(self.copy_stream)
+        self._active[idx] = slot
+
+    def holds(self, idx: int) -> bool:
+        return idx in self._active
+
+    def attach(self, idx: int) -> None:
+        """Point layer `idx`'s tensors at its uploaded slot (after the upload lands)."""
+        slot = self._active[idx]
+        torch.cuda.current_stream().wait_event(slot.ready)
+        for owner, gpu in zip(self._owners[idx], slot.tensors):
+            owner.data = gpu
+
+    def detach(self, idx: int) -> None:
+        """Restore layer `idx`'s CPU tensors and start uploading the next pending layer."""
+        slot = self._active.pop(idx)
+        slot.free.record(torch.cuda.current_stream())
+        for owner, master in zip(self._owners[idx], self._masters[idx]):
+            owner.data = master
+        if self._pending:
+            self._upload(self._pending.pop(0), slot)
+
+    def end(self) -> None:
+        """Release slot memory once all queued work is done; also restores every master
+        (a no-op unless an exception interrupted the forward mid-layer)."""
+        torch.cuda.current_stream().synchronize()
+        for idx, owners in self._owners.items():
+            for owner, master in zip(owners, self._masters[idx]):
+                owner.data = master
+        self._active.clear()
+        self._pending = []
+        for slot in self.slots:
+            slot.tensors = None
+
+
 class Qwen3VLTruncatedTextModel(nn.Module):
     """The first `num_read_layers` decoder layers of a Qwen3-VL text stack, no norm, no lm_head.
 
@@ -182,6 +292,7 @@ class Qwen3VLTruncatedTextModel(nn.Module):
             rope_theta=text_config.get("rope_theta", 1000000.0),
             mrope_section=rope_scaling.get("mrope_section", [24, 20, 20]),
         )
+        self._streamer = None
 
     @torch.no_grad()
     def forward(
@@ -194,35 +305,55 @@ class Qwen3VLTruncatedTextModel(nn.Module):
     ) -> torch.Tensor:
         """One prefill pass. `inputs_embeds` is `[1, T, hidden]` with vision features already scattered in.
 
-        `stream_device`: when set, CPU-resident layers are moved there one at a time for their
-        forward and returned to the CPU afterwards — the whole ~30B conditioner never has to fit
-        on the accelerator at once.
+        `stream_device`: when set, CPU-resident layers run there instead of on the CPU — the
+        whole ~30B conditioner never has to fit on the accelerator at once. On CUDA the
+        layers are double-buffer prefetched from pinned CPU masters (`_LayerStreamer`): layer
+        N+1 uploads on a side stream while layer N computes, and nothing is copied back. On
+        other accelerators each layer is moved over and back synchronously.
         """
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(position_ids.to(inputs_embeds.device), inputs_embeds.dtype)
 
-        for layer_idx, layer in enumerate(self.layers):
-            home = layer.input_layernorm.weight.device
-            stream = stream_device is not None and home.type == "cpu" and stream_device.type != "cpu"
-            run_device = stream_device if stream else home
-            if stream:
-                layer.to(run_device)
-            if hidden_states.device != run_device:
-                hidden_states = hidden_states.to(run_device)
-                position_embeddings = tuple(t.to(run_device) for t in position_embeddings)
+        streamer = None
+        if stream_device is not None and stream_device.type == "cuda":
+            streamed = [i for i, l in enumerate(self.layers) if l.input_layernorm.weight.device.type == "cpu"]
+            if streamed:
+                if self._streamer is None or self._streamer.device != stream_device:
+                    self._streamer = _LayerStreamer(stream_device)
+                streamer = self._streamer
+                streamer.begin(self.layers, streamed)
 
-            hidden_states = layer(hidden_states, position_embeddings)
+        try:
+            for layer_idx, layer in enumerate(self.layers):
+                prefetched = streamer is not None and streamer.holds(layer_idx)
+                home = layer.input_layernorm.weight.device
+                stream = stream_device is not None and home.type == "cpu" and stream_device.type != "cpu"
+                run_device = stream_device if stream else home
+                if stream and not prefetched:
+                    layer.to(run_device)
+                if hidden_states.device != run_device:
+                    hidden_states = hidden_states.to(run_device)
+                    position_embeddings = tuple(t.to(run_device) for t in position_embeddings)
 
-            # Deepstack: add merged ViT features at visual rows after the first
-            # len(deepstack_visual_embeds) layers (Qwen3VLTextModel._deepstack_process parity).
-            if deepstack_visual_embeds is not None and layer_idx < len(deepstack_visual_embeds):
-                mask = visual_pos_masks.to(hidden_states.device)
-                embeds = deepstack_visual_embeds[layer_idx].to(hidden_states.device, hidden_states.dtype)
-                local = hidden_states[mask, :].clone() + embeds
-                hidden_states = hidden_states.clone()
-                hidden_states[mask, :] = local
+                if prefetched:
+                    streamer.attach(layer_idx)
+                hidden_states = layer(hidden_states, position_embeddings)
+                if prefetched:
+                    streamer.detach(layer_idx)
 
-            if stream:
-                layer.to(home)
+                # Deepstack: add merged ViT features at visual rows after the first
+                # len(deepstack_visual_embeds) layers (Qwen3VLTextModel._deepstack_process parity).
+                if deepstack_visual_embeds is not None and layer_idx < len(deepstack_visual_embeds):
+                    mask = visual_pos_masks.to(hidden_states.device)
+                    embeds = deepstack_visual_embeds[layer_idx].to(hidden_states.device, hidden_states.dtype)
+                    local = hidden_states[mask, :].clone() + embeds
+                    hidden_states = hidden_states.clone()
+                    hidden_states[mask, :] = local
+
+                if stream and not prefetched:
+                    layer.to(home)
+        finally:
+            if streamer is not None:
+                streamer.end()
 
         return hidden_states

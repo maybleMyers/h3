@@ -91,8 +91,10 @@ class MiniMaxH3Conditioner:
             dtype: parameter dtype (the released conditioner is bfloat16).
             gpu_layers: how many text decoder layers to keep resident on `device`
                 (-1 = all, 0 = none). The rest stay on CPU.
-            stream_device: when set, CPU-resident layers are streamed there one at a
-                time during the forward.
+            stream_device: when set, CPU-resident layers are streamed there during the
+                forward. On CUDA the CPU weights are pinned on first use and layers are
+                double-buffer prefetched (upload of layer N+1 overlaps layer N's compute;
+                no copy-back), costing ~2 layers of VRAM while encoding.
             text_encoder_path: optional single-file weight override (e.g. an int8
                 convrot export). Text-model weights (and the vision tower, when the
                 file carries `visual.*` keys — the "ultra_p" export does) come from this

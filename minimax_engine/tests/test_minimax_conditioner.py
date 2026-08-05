@@ -275,6 +275,35 @@ def test_truncated_text_model_forward():
     assert not torch.allclose(out[:, -1], out2[:, -1])
 
 
+@torch.no_grad()
+def test_truncated_text_model_streamed_forward_matches():
+    """CUDA-only: the double-buffered streamed forward must match the plain CPU forward."""
+    if not torch.cuda.is_available():
+        import pytest
+
+        pytest.skip("CUDA not available")
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    config = dict(TINY_TEXT_CONFIG, num_hidden_layers=52)
+    model = Qwen3VLTruncatedTextModel(config, num_read_layers=6).eval()
+    embeds = torch.randn(1, 10, config["hidden_size"])
+    position_ids = torch.arange(10).view(1, 1, -1).expand(3, 1, -1)
+    ref = model(embeds, position_ids)
+
+    # First 2 layers GPU-resident, the rest CPU: exercises the mixed-residency path.
+    model.embed_tokens.to(device)
+    for layer in model.layers[:2]:
+        layer.to(device)
+    for _ in range(2):  # second pass reuses the pinned masters and re-allocates slots
+        out = model(embeds.to(device), position_ids.to(device), stream_device=device)
+        torch.testing.assert_close(out.cpu(), ref, atol=3e-5, rtol=3e-5)
+
+    # Masters restored to CPU, slot memory released.
+    for layer in model.layers[2:]:
+        assert layer.input_layernorm.weight.device.type == "cpu"
+    assert all(slot.tensors is None for slot in model._streamer.slots)
+
+
 def test_truncated_text_model_rejects_short_stacks():
     config = dict(TINY_TEXT_CONFIG, num_hidden_layers=3)
     try:
