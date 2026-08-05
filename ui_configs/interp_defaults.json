@@ -1,0 +1,20 @@
+{
+  "interp_model_variant": "BiM-VFI (Bidirectional Motion)",
+  "interp_checkpoint_path": "",
+  "interp_config_path": "",
+  "interp_factor": 2,
+  "interp_ds_scale": 1,
+  "interp_output_fps": 0,
+  "interp_raft_iters": 20,
+  "interp_pyr_level": 7,
+  "interp_seed": 0,
+  "upscale_enable": false,
+  "upscale_model": "Real-ESRGAN x2",
+  "upscale_tile_size": 512,
+  "upscale_half": true,
+  "upscale_model_path": "",
+  "upscale_crf": 18,
+  "motion_blur_enable": true,
+  "motion_blur_strength": 1,
+  "motion_blur_samples": 15
+}

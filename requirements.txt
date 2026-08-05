@@ -1,0 +1,24 @@
+# Core GUI
+gradio
+tiktoken
+pillow
+opencv-python
+imageio-ffmpeg
+
+# MiniMax-H3 engine (minimax_engine/)
+torch
+numpy
+tqdm
+safetensors
+einops
+transformers
+accelerate
+diffusers
+av
+rich
+
+# Frame interpolation / upscaling (GIMM-VFI, BiM-VFI, ESRGAN/SwinIR/BasicVSR++)
+huggingface_hub
+omegaconf
+easydict
+# optional: spandrel (ESRGAN/SwinIR upscalers)
