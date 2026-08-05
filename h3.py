@@ -1191,7 +1191,7 @@ with gr.Blocks(
                     minimax_prompt = gr.Textbox(
                         scale=3,
                         label="Enter your prompt",
-                        value="A red fox trotting through a snowy pine forest, snow crunching underfoot.",
+                        value="A giant green and blue kitty cat eats a deliscious blueberry given to her by a handsomely dressed frog.",
                         lines=5,
                     )
                 with gr.Column(scale=1):

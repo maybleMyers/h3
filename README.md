@@ -6,6 +6,8 @@ A standalone Gradio interface for [MiniMax-H3](https://huggingface.co/MiniMaxAI/
 - **Frame Interpolation** — GIMM-VFI / BiM-VFI frame interpolation plus ESRGAN / SwinIR / BasicVSR++ upscaling and motion blur. Checkpoints auto-download on first use.
 - **Video Info** — reads the generation parameters embedded in any video produced by this app and sends them back to the MiniMax tab to reproduce or iterate on a run.
 
+![MiniMax tab screenshot](minimax_engine/img/screenshot.png)
+
 ## Installation
 
 ### Option A: uv (recommended)
