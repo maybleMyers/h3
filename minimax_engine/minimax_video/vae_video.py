@@ -37,6 +37,17 @@ from .attention import AttentionMixin, AttentionModuleMixin, dispatch_attention_
 logger = logging.getLogger(__name__)
 
 
+def _linear_at_module_dtype(linear: nn.Linear, tensor: torch.Tensor) -> torch.Tensor:
+    """Run `linear` at its weight dtype with autocast off, casting the result back to the input dtype.
+
+    The reference decoder keeps `x_embedder`/`proj_out` in float32 even when the surrounding
+    activations are autocast to half precision.
+    """
+    out_dtype = tensor.dtype
+    with torch.autocast(tensor.device.type, enabled=False):
+        return linear(tensor.to(linear.weight.dtype)).to(out_dtype)
+
+
 class AutoencoderMixin:
     """Local shim for diffusers-main `models.autoencoders.vae.AutoencoderMixin` (absent in 0.33.1).
 
@@ -477,7 +488,7 @@ class MiniMaxH3VideoViTDecoder3d(nn.Module):
         hidden_states = hidden_states.permute(0, 2, 3, 4, 1).reshape(
             batch_size, num_frames * height * width, num_channels
         )
-        hidden_states = self.proj_in(hidden_states)
+        hidden_states = _linear_at_module_dtype(self.proj_in, hidden_states)
         num_patches = hidden_states.shape[1]
 
         register_tokens = self.register_tokens.expand(batch_size, -1, -1)
@@ -501,7 +512,7 @@ class MiniMaxH3VideoViTDecoder3d(nn.Module):
                 hidden_states = block(hidden_states, rotary_emb)
 
         hidden_states = self.norm_out(hidden_states)
-        hidden_states = self.proj_out(hidden_states)
+        hidden_states = _linear_at_module_dtype(self.proj_out, hidden_states)
         hidden_states = hidden_states[:, :num_patches, :]
 
         patch_size, patch_size_t = self.patch_size, self.patch_size_t

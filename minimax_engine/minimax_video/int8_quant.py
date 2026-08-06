@@ -318,6 +318,12 @@ _DIT_TOP_RENAMES = {
     "audio_patch_proj.bias": "audio_proj_in.bias",
     "condition_proj.weight": "context_embedder.weight",
     "condition_proj.bias": "context_embedder.bias",
+    "condition_proj.weight_scale": "context_embedder.weight_scale",
+    "condition_proj.comfy_quant": "context_embedder.comfy_quant",
+    "time_embedder.proj_in.weight": "time_embedder.linear_1.weight",
+    "time_embedder.proj_in.bias": "time_embedder.linear_1.bias",
+    "time_embedder.proj_out.weight": "time_embedder.linear_2.weight",
+    "time_embedder.proj_out.bias": "time_embedder.linear_2.bias",
     "final_layer.norm.weight": "norm_out.norm.weight",
     "final_layer.adaln_proj.linear.weight": "norm_out.linear.weight",
     "final_layer.adaln_proj.linear.bias": "norm_out.linear.bias",
@@ -330,7 +336,7 @@ _DIT_TOP_RENAMES = {
 }
 
 # `rope.inv_freq` is recomputed by MiniMaxH3RotaryPosEmbed (bitwise equal, see the upstream
-# converter); time_embedder keys cannot occur in a curve-form checkpoint.
+# converter). Full (non-curve) exports carry the timestep MLP as time_embedder.proj_in/proj_out.
 _DIT_DROPPED_KEYS = ("rope.inv_freq",)
 
 _DIT_BLOCK_PREFIXES = (

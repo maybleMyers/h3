@@ -211,10 +211,74 @@ def minimax_align_num_frames(num_frames: int) -> int:
     return num_frames
 
 
-# The encodable 17n+5 frame counts inside the released 5-15 s window (124..345 @ 24 fps).
+# The encodable 17n+5 frame counts inside the released 4-15 s window (107..345 @ 24 fps).
 MINIMAX_VIDEO_LENGTH_CHOICES = [("0 — derive from audio reference", 0)] + [
-    (f"{n} frames ({n / 24:.2f} s)", n) for n in range(124, 346, 17)
+    (f"{n} frames ({n / 24:.2f} s)", n) for n in range(107, 346, 17)
 ]
+
+
+def minimax_assemble_template_prompt(
+    task_name: str,
+    imd: str,
+    subjects: str,
+    summary: str,
+    retention: str,
+    detailed: str,
+    soundscape: str,
+    music: str,
+    has_first: bool,
+    has_last: bool,
+    video_length,
+) -> str:
+    """Assemble a structured H3 prompt from the template fields.
+
+    Follows the official H3-Context-IR output format (MiniMax-H3
+    skills/h3-prompt-writing/references/): blank-line-separated `field: value` sections,
+    preceded for fl2va by the keyframe alignment instruction line.
+    """
+    def clean(text):
+        return str(text or "").strip()
+
+    soundscape = clean(soundscape) or "N/A"
+    music = clean(music) or "N/A"
+    sections = []
+
+    if task_name == "ref2va":
+        for field, value in (
+            ("subject_definitions", clean(subjects)),
+            ("summary", clean(summary)),
+            ("retention_analysis", clean(retention)),
+            ("detailed_description", clean(detailed)),
+        ):
+            if not value:
+                raise gr.Error(f"Prompt Template: `{field}` is required for ref2va")
+            sections.append(f"{field}: {value}")
+    else:
+        if not clean(imd):
+            raise gr.Error("Prompt Template: `integrated_multimodal_description` is required")
+        if task_name == "fl2va" and (has_first or has_last):
+            duration = f"{int(video_length) / 24:.2f}"
+            if has_first and has_last:
+                sections.append(
+                    "How the reference pictures align with the target video — Picture 1 (from Shot 1) "
+                    "aligns with the 0.00-second mark of the target video; Picture 2 (from Shot N) "
+                    f"aligns with the {duration}-second mark of the target video."
+                )
+            elif has_first:
+                sections.append(
+                    "For the target video, at 0.00 seconds into the target video, <Picture 1> "
+                    "(from [Shot 1]) is fully referenced."
+                )
+            else:
+                sections.append(
+                    "How the reference pictures align with the target video — <Picture 1> "
+                    f"(from [Shot N]) aligns with the {duration}-second mark of the target video."
+                )
+        sections.append(f"integrated_multimodal_description: {clean(imd)}")
+
+    sections.append(f"overall_soundscape: {soundscape}")
+    sections.append(f"non_diegetic_music: {music}")
+    return "\n\n".join(sections)
 
 
 def minimax_reference_kind(path: str) -> str:
@@ -329,7 +393,14 @@ def minimax_submit_to_queue(
     reference_files,
     reference_order: str,
     reference_strip_audio: bool,
-    aspect_ratio: str,
+    prompt_template: bool,
+    tpl_imd: str,
+    tpl_subjects: str,
+    tpl_summary: str,
+    tpl_retention: str,
+    tpl_detailed: str,
+    tpl_soundscape: str,
+    tpl_music: str,
     width,
     height,
     video_length,
@@ -423,14 +494,14 @@ def minimax_submit_to_queue(
     if len(ref_kinds) > 12:
         raise gr.Error(f"MiniMax-H3 accepts at most 12 references, got {len(ref_kinds)}")
 
-    # Frame count: 17n+5 at 24 fps, 5-15 s. 0/blank on ref2va = derive from the audio reference.
+    # Frame count: 17n+5 at 24 fps, 4-15 s. 0/blank on ref2va = derive from the audio reference.
     video_length = opt_number(video_length)
     if video_length is not None:
         video_length = minimax_align_num_frames(video_length)
-        if not 124 <= video_length <= 345:
+        if not 107 <= video_length <= 345:
             raise gr.Error(
-                f"MiniMax-H3 generates 5-15 seconds at 24 fps: video length (snapped to 17n+5) must be "
-                f"124-345 frames, got {video_length}"
+                f"MiniMax-H3 generates 4-15 seconds at 24 fps: video length (snapped to 17n+5) must be "
+                f"107-345 frames, got {video_length}"
             )
     elif task_name != "ref2va":
         video_length = 124
@@ -443,6 +514,12 @@ def minimax_submit_to_queue(
         height = max(32, (int(height) // 32) * 32)
     else:
         width = height = None
+
+    if prompt_template:
+        prompt = minimax_assemble_template_prompt(
+            task_name, tpl_imd, tpl_subjects, tpl_summary, tpl_retention, tpl_detailed,
+            tpl_soundscape, tpl_music, bool(input_image), bool(last_image), video_length,
+        )
 
     # TAEHV previews: resolve + download the checkpoint up front so generation never waits on
     # (or fails over) a network fetch mid-run.
@@ -483,8 +560,6 @@ def minimax_submit_to_queue(
 
         if width is not None and height is not None:
             command.extend(["--video_size", str(height), str(width)])
-        elif aspect_ratio and task_name != "fl2va":
-            command.extend(["--aspect_ratio", str(aspect_ratio)])
 
         if current_seed >= 0:
             command.extend(["--seed", str(current_seed)])
@@ -569,7 +644,6 @@ def minimax_submit_to_queue(
             "model_type": "MiniMax-H3",
             "prompt": prompt,
             "task": task_name,
-            "aspect_ratio": aspect_ratio,
             "video_length": video_length,
             "fps": 24,
             "infer_steps": infer_steps,
@@ -1247,11 +1321,61 @@ with gr.Blocks(
                     )
                 with gr.Column(scale=1):
                     minimax_token_counter = gr.Number(label="Prompt Token Count", value=0, interactive=False)
-                    minimax_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+                    with gr.Row():
+                        minimax_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+                        minimax_prompt_template = gr.Checkbox(
+                            label="Prompt Template", value=False,
+                            info="structured Context-IR prompt fields for the selected task; "
+                                 "the freeform prompt box is ignored while enabled",
+                        )
                 with gr.Column(scale=2):
                     minimax_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
                     minimax_progress_text = gr.Textbox(label="Progress", interactive=False, value="",
                                                        elem_id="minimax_progress_text")
+
+            with gr.Group(visible=False) as minimax_template_group:
+                gr.Markdown(
+                    "Structured prompt per the official H3 format "
+                    "(`MiniMax-H3/skills/h3-prompt-writing/references/`). The keyframe alignment "
+                    "line for fl2va is generated automatically from the keyframes and video length."
+                )
+                minimax_tpl_imd = gr.Textbox(
+                    label="integrated_multimodal_description",
+                    info="[Shot 1] style, subjects, action, camera grammar; (S1) speakers; "
+                         "<d>[Language] dialogue</d>; later shots open with 'At MM:SS.mmm, the camera cuts to'",
+                    lines=5,
+                )
+                minimax_tpl_subjects = gr.Textbox(
+                    label="subject_definitions", visible=False,
+                    info="<Subject 1>: ... one line per subject, tied to <Picture/Video N> references",
+                    lines=3,
+                )
+                minimax_tpl_summary = gr.Textbox(
+                    label="summary", visible=False,
+                    info="starts with the bracketed task type, e.g. [reference generation] ...",
+                    lines=2,
+                )
+                minimax_tpl_retention = gr.Textbox(
+                    label="retention_analysis", visible=False,
+                    info="<Subject/Picture/Video N> (...): fully_preserved / partially_preserved / "
+                         "attribute_transfer / weak_reference; audio: fully_copy / partially_copy / "
+                         "reference / weak_reference",
+                    lines=3,
+                )
+                minimax_tpl_detailed = gr.Textbox(
+                    label="detailed_description", visible=False,
+                    info="shot-by-shot description, same grammar as integrated_multimodal_description",
+                    lines=5,
+                )
+                with gr.Row():
+                    minimax_tpl_soundscape = gr.Textbox(
+                        label="overall_soundscape",
+                        info="ambience only, no dialogue or music; N/A for silence", lines=2,
+                    )
+                    minimax_tpl_music = gr.Textbox(
+                        label="non_diegetic_music",
+                        info="score only: instrumentation, tempo, dynamics; N/A if none", lines=2,
+                    )
 
             with gr.Row():
                 minimax_generate_btn = gr.Button("Generate", elem_classes="green-btn")
@@ -1320,12 +1444,6 @@ with gr.Blocks(
                         )
 
                     gr.Markdown("### Generation Parameters")
-                    with gr.Row():
-                        minimax_aspect_ratio = gr.Dropdown(
-                            label="Aspect Ratio (auto canvas: 768px short edge, ×32; ignored for fl2va)",
-                            choices=["16:9", "9:16", "1:1", "4:3", "3:4", "21:9", "2:1", "1:2"],
-                            value="16:9",
-                        )
                     minimax_original_dims = gr.Textbox(visible=False, value="")
                     with gr.Row():
                         minimax_width = gr.Number(label="Width (blank = auto; ×32)", value=None, step=32)
@@ -1333,7 +1451,7 @@ with gr.Blocks(
                         minimax_calc_width_btn = gr.Button("←")
                         minimax_height = gr.Number(label="Height (blank = auto; ×32)", value=None, step=32)
                     minimax_video_length = gr.Dropdown(
-                        label="Video Length (frames @ 24 fps; the VAE encodes 17n+5 frames, 5–15 s)",
+                        label="Video Length (frames @ 24 fps; the VAE encodes 17n+5 frames, 4–15 s)",
                         choices=MINIMAX_VIDEO_LENGTH_CHOICES,
                         value=124,
                     )
@@ -1793,7 +1911,14 @@ with gr.Blocks(
             minimax_reference_state,
             minimax_reference_order,
             minimax_reference_strip_audio,
-            minimax_aspect_ratio,
+            minimax_prompt_template,
+            minimax_tpl_imd,
+            minimax_tpl_subjects,
+            minimax_tpl_summary,
+            minimax_tpl_retention,
+            minimax_tpl_detailed,
+            minimax_tpl_soundscape,
+            minimax_tpl_music,
             minimax_width,
             minimax_height,
             minimax_video_length,
@@ -1946,7 +2071,7 @@ with gr.Blocks(
         return (files, None, minimax_default_reference_order(files),
                 minimax_reference_preview_html(files))
 
-    minimax_reference_files.upload(
+    minimax_reference_upload_dep = minimax_reference_files.upload(
         fn=minimax_add_references,
         inputs=[minimax_reference_state, minimax_reference_files],
         outputs=[minimax_reference_state, minimax_reference_files,
@@ -1964,7 +2089,7 @@ with gr.Blocks(
         return (files, minimax_default_reference_order(files),
                 minimax_reference_preview_html(files))
 
-    minimax_reference_remove_btn.click(
+    minimax_reference_remove_dep = minimax_reference_remove_btn.click(
         fn=minimax_remove_reference,
         inputs=[minimax_reference_state, minimax_reference_remove_idx],
         outputs=[minimax_reference_state, minimax_reference_order, minimax_reference_preview],
@@ -1973,12 +2098,54 @@ with gr.Blocks(
     def minimax_clear_references():
         return [], None, "", minimax_reference_preview_html([])
 
-    minimax_reference_clear_btn.click(
+    minimax_reference_clear_dep = minimax_reference_clear_btn.click(
         fn=minimax_clear_references,
         inputs=None,
         outputs=[minimax_reference_state, minimax_reference_files,
                  minimax_reference_order, minimax_reference_preview],
     )
+
+    # Prompt Template visibility: the group follows the checkbox; the fields follow the
+    # effective task (same resolution as submit: override wins, else references → ref2va,
+    # keyframes → fl2va, else t2va).
+    def minimax_update_template_fields(enabled, task_override, references, input_image, last_image):
+        if task_override and task_override != "auto":
+            task = task_override
+        elif references:
+            task = "ref2va"
+        elif input_image or last_image:
+            task = "fl2va"
+        else:
+            task = "t2va"
+        is_ref = task == "ref2va"
+        return (
+            gr.update(visible=bool(enabled)),
+            gr.update(visible=not is_ref),   # integrated_multimodal_description
+            gr.update(visible=is_ref),       # subject_definitions
+            gr.update(visible=is_ref),       # summary
+            gr.update(visible=is_ref),       # retention_analysis
+            gr.update(visible=is_ref),       # detailed_description
+        )
+
+    minimax_template_vis_inputs = [minimax_prompt_template, minimax_task_override,
+                                   minimax_reference_state, minimax_input_image, minimax_last_image]
+    minimax_template_vis_outputs = [minimax_template_group, minimax_tpl_imd, minimax_tpl_subjects,
+                                    minimax_tpl_summary, minimax_tpl_retention, minimax_tpl_detailed]
+    for _event in (
+        minimax_prompt_template.change,
+        minimax_task_override.change,
+        minimax_input_image.change,
+        minimax_last_image.change,
+        # Reference-set mutations chain after their handler so the state is current.
+        minimax_reference_upload_dep.then,
+        minimax_reference_remove_dep.then,
+        minimax_reference_clear_dep.then,
+    ):
+        _event(
+            fn=minimax_update_template_fields,
+            inputs=minimax_template_vis_inputs,
+            outputs=minimax_template_vis_outputs,
+        )
 
     minimax_ui_default_components_ORDERED_LIST = [
         minimax_ckpt_dir,
@@ -2004,7 +2171,6 @@ with gr.Blocks(
         minimax_compile,
         minimax_save_path,
         minimax_lora_folder,
-        minimax_aspect_ratio,
         minimax_video_length,
         minimax_infer_steps,
         minimax_flow_shift,
@@ -2042,7 +2208,6 @@ with gr.Blocks(
         "minimax_compile",
         "minimax_save_path",
         "minimax_lora_folder",
-        "minimax_aspect_ratio",
         "minimax_video_length",
         "minimax_infer_steps",
         "minimax_flow_shift",
@@ -2099,7 +2264,7 @@ with gr.Blocks(
                 try:
                     v = int(float(value_to_set))
                     value_to_set = 0 if v <= 0 else min(
-                        max(124, minimax_align_num_frames(v)), 345
+                        max(107, minimax_align_num_frames(v)), 345
                     )
                 except (TypeError, ValueError):
                     value_to_set = 124
@@ -2252,14 +2417,10 @@ with gr.Blocks(
             video_length = 0
         else:
             try:
-                video_length = min(max(124, minimax_align_num_frames(int(float(raw_length)))), 345)
+                video_length = min(max(107, minimax_align_num_frames(int(float(raw_length)))), 345)
             except (TypeError, ValueError):
                 video_length = 124
 
-        aspect = params.get("aspect_ratio")
-        aspect_update = (gr.update(value=aspect)
-                         if aspect in ("16:9", "9:16", "1:1", "4:3", "3:4", "21:9", "2:1", "1:2")
-                         else gr.update())
         attn = params.get("attn_mode")
         attn_update = (gr.update(value=attn)
                        if attn in ("torch", "sdpa", "flash", "flashattn", "flash2",
@@ -2277,7 +2438,6 @@ with gr.Blocks(
             None,                                             # minimax_reference_files
             reference_order,                                  # minimax_reference_order
             minimax_reference_preview_html(references),       # minimax_reference_preview
-            aspect_update,                                    # minimax_aspect_ratio
             gr.update(value=None),                            # minimax_width (auto)
             gr.update(value=None),                            # minimax_height (auto)
             gr.update(value=video_length),                    # minimax_video_length
@@ -2331,7 +2491,7 @@ with gr.Blocks(
             minimax_prompt, minimax_task_override, minimax_input_image, minimax_last_image,
             minimax_reference_state, minimax_reference_files, minimax_reference_order,
             minimax_reference_preview,
-            minimax_aspect_ratio, minimax_width, minimax_height, minimax_video_length,
+            minimax_width, minimax_height, minimax_video_length,
             minimax_infer_steps, minimax_flow_shift, minimax_audio_flow_shift,
             minimax_seed, minimax_num_outputs, minimax_ckpt_dir, minimax_attn_mode,
             minimax_sol_tau, minimax_blocks_to_swap, minimax_compile, minimax_save_path,

@@ -102,6 +102,30 @@ In the MiniMax tab, set **Checkpoint Dir** to `/path/to/MiniMax-H3-diffusers` (o
 
 The **DiT Override** and **Text Encoder Override** fields accept single-file exports instead of the checkpoint-dir components — including int8 "convrot" quantized exports (auto-detected; enable **INT8 Fast** to run them through `torch._int_mm`). The `ultra_p` style text-encoder export also carries the vision tower needed for `ref2va` image/video references.
 
+## Prompting
+
+MiniMax-H3 was trained on structured prompts produced by the hosted H3-Context-IR system, and it follows them far better than free-form text. The full official format guides ship with the [MiniMax-H3 GitHub repo](https://github.com/MiniMax-AI/MiniMax-H3) under `skills/h3-prompt-writing/references/` — `base-en.txt` for t2va/fl2va and `ref-en.txt` for ref2va. The MiniMax tab's **Prompt Template** checkbox (next to Batch Count) scaffolds this format for you: it shows one field per section and assembles the final prompt, including the keyframe-alignment first line for fl2va.
+
+**t2va / fl2va** — blank-line-separated sections, each written as `field: value`:
+
+```
+integrated_multimodal_description: [Shot 1] Cinematic, live-action ... (S1) says <d>[English] Hello there.</d> ... At 00:03.500, the camera cuts to [Shot 2] ...
+
+overall_soundscape: Rain patters on the tin roof; distant thunder.
+
+non_diegetic_music: A slow solo piano line, sparse and melancholic.
+```
+
+- Shots are `[Shot 1]`, `[Shot 2]`, …; every shot after the first opens with a strictly increasing `At MM:SS.mmm,` cut timestamp.
+- Speakers are `(S1)`, `(S2)`; dialogue/lyrics go inside `<d>[Language] verbatim words</d>` (never translated, punctuation preserved). On-screen text goes in double quotes.
+- Camera moves use the official grammar: motion type (`Push In`, `Pan Left`, `Tracking Shot`, `Static Shot`, …) + optional `with small/large amplitude` + optional `at slow/fast speed`.
+- `overall_soundscape` is ambience only (no dialogue or music); `non_diegetic_music` describes score only; either may be `N/A`.
+- With keyframes, the prompt starts with an alignment line (before the sections, separated by a blank line). First frame only: `For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.` Both frames: `How the reference pictures align with the target video — Picture 1 (from Shot 1) aligns with the 0.00-second mark of the target video; Picture 2 (from Shot N) aligns with the S.SS-second mark of the target video.`
+
+**ref2va** — six sections in this exact order: `subject_definitions`, `summary`, `retention_analysis`, `detailed_description`, `overall_soundscape`, `non_diegetic_music`. References are labeled `<Subject N>` / `<Picture N>` / `<Video N>` / `<Audio N>`; `summary` opens with a bracketed task type (`[reference generation]`, `[keyframe completion]`, `[video editing]`, `[video continuation]`, `[audio reuse]`, `[audio reference]`, combined with ` + `); `retention_analysis` marks each reference `fully_preserved` / `partially_preserved` / `attribute_transfer` / `weak_reference` (audio: `fully_copy` / `partially_copy` / `reference` / `weak_reference`); `detailed_description` uses the same shot/camera/`<d>` grammar as the base modes.
+
+The tags `<d>`, `</d>`, `<|cutoff|>`, `<|lyrics_start|>`, `<|lyrics_end|>`, `<|caption_start|>`, `<|caption_end|>` are dedicated tokenizer tokens (ids 151669–151675) registered by the official repo's `tokenizer_config.json` — use the tokenizer/processor from the official release (the repo clone or HF snapshot), as MiniMax requires.
+
 ## VRAM guidance
 
 - Full-quality bf16 DiT: **61.7 GB** — needs Blocks to Swap on 48 GB cards.
