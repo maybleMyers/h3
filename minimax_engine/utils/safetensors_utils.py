@@ -111,8 +111,7 @@ class MemoryEfficientSafeOpen:
         if offset_start == offset_end:
             tensor_bytes = None
         else:
-            # adjust offset by header size; readinto a preallocated bytearray so
-            # _deserialize_tensor can wrap it without a second copy
+            # adjust offset by header size
             self.file.seek(self.header_size + 8 + offset_start)
             tensor_bytes = bytearray(offset_end - offset_start)
             n = self.file.readinto(tensor_bytes)
@@ -185,28 +184,45 @@ def _default_read_threads() -> int:
         return 8
 
 
-def stream_safetensors(path: str, num_threads: Optional[int] = None, read_ahead: Optional[int] = None):
-    """Yield (key, tensor) pairs from a .safetensors file in header order.
+def _should_drop_page_cache(path: str) -> bool:
+    env = os.environ.get("H3_LOAD_DROP_CACHE")
+    if env is not None:
+        return env.strip().lower() not in ("0", "false", "no", "")
+    return os.path.getsize(path) >= (1 << 30)
 
-    Reads are fanned out over a thread pool using positional reads (os.preadv on a shared
-    fd, which releases the GIL), so an NVMe sees queue depth ~num_threads instead of the
-    single-threaded QD1 of MemoryEfficientSafeOpen.get_tensor. Tensors are still yielded
-    in file order, so per-tensor consumers (LoRA merge hooks, fp8 quantization) behave
-    identically. At most `read_ahead` tensors are in flight, bounding transient RAM.
 
-    num_threads defaults to $H3_LOAD_THREADS or 8; set to 1 (or run on a platform
-    without os.preadv) for the sequential fallback.
+def stream_safetensors(
+    path: str,
+    num_threads: Optional[int] = None,
+    read_ahead: Optional[int] = None,
+    drop_page_cache: Optional[bool] = None,
+):
+    """Yield (key, tensor) in file order, reading with a thread pool (os.preadv, QD ~num_threads).
+
+    drop_page_cache (default: on for files >= 1 GB, override $H3_LOAD_DROP_CACHE=0/1) evicts
+    each tensor's range from the kernel page cache after reading, so a model-sized file does
+    not double apparent RAM use during load. num_threads defaults to $H3_LOAD_THREADS or 8.
     """
     if num_threads is None:
         num_threads = _default_read_threads()
+    if drop_page_cache is None:
+        drop_page_cache = _should_drop_page_cache(path)
+    drop_page_cache = drop_page_cache and hasattr(os, "posix_fadvise")
     with MemoryEfficientSafeOpen(path) as f:
         keys = f.keys()
+        data_start = f.header_size + 8
         if num_threads <= 1 or not hasattr(os, "preadv"):
+            seq_fd = f.file.fileno()
             for key in keys:
                 yield key, f.get_tensor(key)
+                if drop_page_cache:
+                    offset_start, offset_end = f.header[key]["data_offsets"]
+                    if offset_end > offset_start:
+                        os.posix_fadvise(
+                            seq_fd, data_start + offset_start, offset_end - offset_start, os.POSIX_FADV_DONTNEED
+                        )
             return
 
-        data_start = f.header_size + 8
         fd = os.open(path, os.O_RDONLY)
         try:
 
@@ -223,6 +239,8 @@ def stream_safetensors(path: str, num_threads: Optional[int] = None, read_ahead:
                     if n <= 0:
                         raise IOError(f"short read for tensor '{key}' in {path}")
                     pos += n
+                if drop_page_cache:
+                    os.posix_fadvise(fd, data_start + offset_start, length, os.POSIX_FADV_DONTNEED)
                 return buf
 
             if read_ahead is None:
@@ -261,7 +279,6 @@ def load_safetensors(
         return total_state_dict
 
     if disable_mmap:
-        # parallel positional reads; see stream_safetensors
         state_dict = {}
         for key, value in stream_safetensors(path):
             state_dict[key] = value.to(device, dtype=dtype)

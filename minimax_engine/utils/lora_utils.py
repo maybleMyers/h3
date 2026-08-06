@@ -351,7 +351,6 @@ def load_safetensors_with_lora_and_fp8(
     state_dict = {}
     for model_file in model_files:
         for key, value in tqdm(stream_safetensors(model_file), desc=f"Loading {os.path.basename(model_file)} with LoRA merge", leave=False, miniters=100, file=sys.stdout, dynamic_ncols=False):
-            # Apply the hook to merge LoRA weights (runs on this thread; only reads are parallel)
             value = weight_hook_func(key, value)
 
             if move_to_device:

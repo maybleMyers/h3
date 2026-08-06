@@ -177,8 +177,6 @@ def optimize_state_dict_with_fp8_on_the_fly(
 
             optimized_count += 1
 
-            # a per-layer empty_cache costs tens of ms each across hundreds of layers;
-            # flush periodically instead (the per-tensor transient is a single weight)
             if calc_device is not None and optimized_count % 64 == 0:
                 clean_memory_on_device(calc_device)
 
