@@ -1503,6 +1503,7 @@ with gr.Blocks(
 
             with gr.Row():
                 send_to_minimax_btn = gr.Button("Send to MiniMax", variant="primary")
+                send_first_frame_btn = gr.Button("Send First Frame as Image Guidance")
 
             with gr.Row():
                 status = gr.Textbox(label="Status", interactive=False)
@@ -2292,6 +2293,29 @@ with gr.Blocks(
             opt("compile", bool),                             # minimax_compile
             opt("save_path", str),                            # minimax_save_path
         ]
+
+    def handle_send_first_frame(video_path: str):
+        if not video_path:
+            return "No video loaded", gr.update()
+        cap = cv2.VideoCapture(video_path)
+        ret, frame = cap.read()
+        cap.release()
+        if not ret:
+            return "Could not read first frame from video", gr.update()
+        frame_path = os.path.join("temp_frames", f"first_frame_{int(time.time())}.png")
+        os.makedirs("temp_frames", exist_ok=True)
+        cv2.imwrite(frame_path, frame)
+        return "First frame sent as image guidance", gr.update(value=frame_path)
+
+    send_first_frame_btn.click(
+        fn=handle_send_first_frame,
+        inputs=[video_input],
+        outputs=[status, minimax_input_image],
+    ).then(
+        fn=change_to_minimax_tab,
+        inputs=None,
+        outputs=[tabs],
+    )
 
     send_to_minimax_btn.click(
         fn=handle_send_to_minimax_tab,
