@@ -451,7 +451,10 @@ def _load_int8_transformer(
     # int8 tensors cannot carry grads; must be flipped before load_state_dict(assign=True)
     model.requires_grad_(False)
 
-    sd, quant_map = convert_int8_dit_state_dict(stream_safetensors(checkpoint_path))
+    # Pruned curve exports were de-interleaved at export time; full exports keep the raw
+    # upstream per-head-interleaved QKV rows and need the reorder during conversion.
+    qkv_head_dim = 0 if curve else int(config.get("attention_head_dim", 128))
+    sd, quant_map = convert_int8_dit_state_dict(stream_safetensors(checkpoint_path), qkv_head_dim=qkv_head_dim)
 
     # dtype policy: int8 weights and their float32 scales stay untouched; the mixed-precision
     # float32 islands (patch projections, output heads) stay float32; the curve table and the

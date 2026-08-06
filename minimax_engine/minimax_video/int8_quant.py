@@ -307,9 +307,10 @@ def merge_lora_deltas_into_int8(
 # is `silu(first_half) * second_half`). The port splits QKV into `to_q/to_k/to_v` and stores
 # SwiGLU as `[value; gate]` (diffusers order), so QKV converts by a plain 3-way row split and
 # fc1 by swapping the two row halves — pure row permutations, which apply identically to the
-# int8 rows and their per-row scales with no requantization. NOTE: the *raw* upstream shards
-# are per-head interleaved and need `_convert_minimax_h3_upstream.reorder_interleaved_qkv`;
-# these single-file exports do NOT.
+# int8 rows and their per-row scales with no requantization. QKV row order differs per export
+# family: the pruned curve-form exports were de-interleaved at export time, while the full
+# exports keep the raw upstream per-head-interleaved rows ([h0q; h0k; h0v; h1q; ...]) and
+# need `qkv_head_dim` set so the rows de-interleave before the split.
 
 _DIT_TOP_RENAMES = {
     "video_patch_proj.weight": "proj_in.weight",
@@ -365,10 +366,18 @@ def _split_block_key(key: str) -> Optional[tuple[str, str]]:
     return None
 
 
-def convert_int8_dit_tensor(key: str, value: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
+def _deinterleave_qkv_rows(value: torch.Tensor, head_dim: int) -> torch.Tensor:
+    """Per-head-interleaved fused rows -> [q_all; k_all; v_all] (weight or per-row scale)."""
+    rows = value.shape[0]
+    heads = rows // (3 * head_dim)
+    return value.reshape(heads, 3, head_dim, -1).transpose(0, 1).reshape(rows, *value.shape[1:])
+
+
+def convert_int8_dit_tensor(key: str, value: torch.Tensor, qkv_head_dim: int = 0) -> list[tuple[str, torch.Tensor]]:
     """Convert one single-file-export DiT tensor (weight, weight_scale or quant marker) to
     the port's diffusers-layout key(s). Returns [] for dropped keys. Raises on unknown keys so
-    a layout drift fails loudly instead of silently missing weights."""
+    a layout drift fails loudly instead of silently missing weights. `qkv_head_dim` (when
+    nonzero) de-interleaves per-head-interleaved fused QKV rows before the split."""
     if key in _DIT_DROPPED_KEYS:
         return []
     if key in _DIT_TOP_RENAMES:
@@ -390,6 +399,8 @@ def convert_int8_dit_tensor(key: str, value: torch.Tensor) -> list[tuple[str, to
         names = ("attn.to_q", "attn.to_k", "attn.to_v")
         if leaf == "comfy_quant":
             return [(f"{target_block}{name}.{leaf}", value) for name in names]
+        if qkv_head_dim:
+            value = _deinterleave_qkv_rows(value, qkv_head_dim)
         parts = value.chunk(3, dim=0)
         return [(f"{target_block}{name}.{leaf}", part.contiguous()) for name, part in zip(names, parts)]
     if stem == "attn.out_proj":
@@ -404,12 +415,14 @@ def convert_int8_dit_tensor(key: str, value: torch.Tensor) -> list[tuple[str, to
     raise KeyError(f"unrecognized MiniMax-H3 single-file checkpoint key: {key}")
 
 
-def convert_int8_dit_state_dict(tensors: Iterator[tuple[str, torch.Tensor]]) -> tuple[dict, dict[str, dict]]:
+def convert_int8_dit_state_dict(
+    tensors: Iterator[tuple[str, torch.Tensor]], qkv_head_dim: int = 0
+) -> tuple[dict, dict[str, dict]]:
     """Stream-convert a single-file MiniMax-H3 export into (native state dict, quant map).
     The quant map holds {native module path: quant marker dict}."""
     sd: dict[str, torch.Tensor] = {}
     for key, value in tensors:
-        for native_key, tensor in convert_int8_dit_tensor(key, value):
+        for native_key, tensor in convert_int8_dit_tensor(key, value, qkv_head_dim):
             sd[native_key] = tensor
     markers = collect_quant_markers(sd)
     return sd, markers
