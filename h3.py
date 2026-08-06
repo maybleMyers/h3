@@ -1503,7 +1503,7 @@ with gr.Blocks(
 
             with gr.Row():
                 send_to_minimax_btn = gr.Button("Send to MiniMax", variant="primary")
-                send_first_frame_btn = gr.Button("Send First Frame as Image Guidance")
+                send_first_frame_btn = gr.Button("Send First Frame + Prompt")
 
             with gr.Row():
                 status = gr.Textbox(label="Status", interactive=False)
@@ -2294,23 +2294,26 @@ with gr.Blocks(
             opt("save_path", str),                            # minimax_save_path
         ]
 
-    def handle_send_first_frame(video_path: str):
+    def handle_send_first_frame(video_path: str, metadata: dict):
         if not video_path:
-            return "No video loaded", gr.update()
+            return "No video loaded", gr.update(), gr.update()
         cap = cv2.VideoCapture(video_path)
         ret, frame = cap.read()
         cap.release()
         if not ret:
-            return "Could not read first frame from video", gr.update()
+            return "Could not read first frame from video", gr.update(), gr.update()
         frame_path = os.path.join("temp_frames", f"first_frame_{int(time.time())}.png")
         os.makedirs("temp_frames", exist_ok=True)
         cv2.imwrite(frame_path, frame)
-        return "First frame sent as image guidance", gr.update(value=frame_path)
+        prompt = (metadata or {}).get("prompt") or extract_video_metadata(video_path).get("prompt")
+        prompt_update = gr.update(value=prompt) if prompt else gr.update()
+        suffix = " and prompt" if prompt else " (no prompt in metadata)"
+        return f"First frame{suffix} sent to MiniMax", gr.update(value=frame_path), prompt_update
 
     send_first_frame_btn.click(
         fn=handle_send_first_frame,
-        inputs=[video_input],
-        outputs=[status, minimax_input_image],
+        inputs=[video_input, metadata_output],
+        outputs=[status, minimax_input_image, minimax_prompt],
     ).then(
         fn=change_to_minimax_tab,
         inputs=None,
