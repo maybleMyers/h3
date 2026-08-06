@@ -9,7 +9,7 @@ import logging
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-from utils.safetensors_utils import MemoryEfficientSafeOpen, load_safetensors
+from utils.safetensors_utils import MemoryEfficientSafeOpen, load_safetensors, stream_safetensors
 
 
 def filter_lora_state_dict(
@@ -112,12 +112,10 @@ def load_safetensors_with_lora_and_fp8(
         # No LoRA weights, just load the model normally
         state_dict = {}
         for model_file in model_files:
-            with MemoryEfficientSafeOpen(model_file) as f:
-                for key in tqdm(f.keys(), desc=f"Loading {os.path.basename(model_file)}", leave=False, miniters=100, file=sys.stdout, dynamic_ncols=False):
-                    value = f.get_tensor(key)
-                    if move_to_device:
-                        value = value.to(calc_device)
-                    state_dict[key] = value
+            for key, value in tqdm(stream_safetensors(model_file), desc=f"Loading {os.path.basename(model_file)}", leave=False, miniters=100, file=sys.stdout, dynamic_ncols=False):
+                if move_to_device:
+                    value = value.to(calc_device)
+                state_dict[key] = value
         return state_dict
 
     # Prepare LoRA weight lookups for efficient access
@@ -352,16 +350,13 @@ def load_safetensors_with_lora_and_fp8(
     # Load model with LoRA merging hook
     state_dict = {}
     for model_file in model_files:
-        with MemoryEfficientSafeOpen(model_file) as f:
-            for key in tqdm(f.keys(), desc=f"Loading {os.path.basename(model_file)} with LoRA merge", leave=False, miniters=100, file=sys.stdout, dynamic_ncols=False):
-                value = f.get_tensor(key)
-                
-                # Apply the hook to merge LoRA weights
-                value = weight_hook_func(key, value)
-                
-                if move_to_device:
-                    value = value.to(calc_device)
-                state_dict[key] = value
+        for key, value in tqdm(stream_safetensors(model_file), desc=f"Loading {os.path.basename(model_file)} with LoRA merge", leave=False, miniters=100, file=sys.stdout, dynamic_ncols=False):
+            # Apply the hook to merge LoRA weights (runs on this thread; only reads are parallel)
+            value = weight_hook_func(key, value)
+
+            if move_to_device:
+                value = value.to(calc_device)
+            state_dict[key] = value
 
     # Check for unused LoRA keys
     for i, lora_weight_keys in enumerate(list_of_lora_weight_keys):

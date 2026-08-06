@@ -6,7 +6,7 @@ import logging
 
 from tqdm import tqdm
 
-from utils.safetensors_utils import MemoryEfficientSafeOpen
+from utils.safetensors_utils import MemoryEfficientSafeOpen, stream_safetensors
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -138,51 +138,52 @@ def optimize_state_dict_with_fp8_on_the_fly(
     # process each model file
     state_dict = {}
     for model_file in model_files:
-        with MemoryEfficientSafeOpen(model_file) as f:
-            keys = f.keys()
-            for key in tqdm(keys, desc=f"Loading {model_file}", unit="key"):
-                value = f.get_tensor(key)
-                if weight_hook is not None:
-                    value = weight_hook(key, value)
+        for key, value in tqdm(stream_safetensors(model_file), desc=f"Loading {model_file}", unit="key"):
+            if weight_hook is not None:
+                value = weight_hook(key, value)
 
-                if not is_target_key(key):
-                    state_dict[key] = value
-                    continue
+            if not is_target_key(key):
+                state_dict[key] = value
+                continue
 
-                # Save original device and dtype
-                original_device = value.device
-                original_dtype = value.dtype
+            # Save original device and dtype
+            original_device = value.device
+            original_dtype = value.dtype
 
-                # Move to calculation device
-                if calc_device is not None:
-                    value = value.to(calc_device)
+            # Move to calculation device
+            if calc_device is not None:
+                value = value.to(calc_device)
 
-                # Calculate scale factor
-                scale = torch.max(torch.abs(value.flatten())) / max_value
-                # print(f"Optimizing {key} with scale: {scale}")
+            # Calculate scale factor
+            scale = torch.max(torch.abs(value.flatten())) / max_value
+            # print(f"Optimizing {key} with scale: {scale}")
 
-                # Quantize weight to FP8
-                quantized_weight, _ = quantize_tensor_to_fp8(value, scale, exp_bits, mantissa_bits, 1, max_value, min_value)
+            # Quantize weight to FP8
+            quantized_weight, _ = quantize_tensor_to_fp8(value, scale, exp_bits, mantissa_bits, 1, max_value, min_value)
 
-                # Add to state dict using original key for weight and new key for scale
-                fp8_key = key  # Maintain original key
-                scale_key = key.replace(".weight", ".scale_weight")
+            # Add to state dict using original key for weight and new key for scale
+            fp8_key = key  # Maintain original key
+            scale_key = key.replace(".weight", ".scale_weight")
 
-                quantized_weight = quantized_weight.to(fp8_dtype)
+            quantized_weight = quantized_weight.to(fp8_dtype)
 
-                if not move_to_device:
-                    quantized_weight = quantized_weight.to(original_device)
+            if not move_to_device:
+                quantized_weight = quantized_weight.to(original_device)
 
-                scale_tensor = torch.tensor([scale], dtype=original_dtype, device=quantized_weight.device)
+            scale_tensor = torch.tensor([scale], dtype=original_dtype, device=quantized_weight.device)
 
-                state_dict[fp8_key] = quantized_weight
-                state_dict[scale_key] = scale_tensor
+            state_dict[fp8_key] = quantized_weight
+            state_dict[scale_key] = scale_tensor
 
-                optimized_count += 1
+            optimized_count += 1
 
-                if calc_device is not None:  # optimized_count % 10 == 0 and
-                    # free memory on calculation device
-                    clean_memory_on_device(calc_device)
+            # a per-layer empty_cache costs tens of ms each across hundreds of layers;
+            # flush periodically instead (the per-tensor transient is a single weight)
+            if calc_device is not None and optimized_count % 64 == 0:
+                clean_memory_on_device(calc_device)
+
+    if calc_device is not None and optimized_count > 0:
+        clean_memory_on_device(calc_device)
 
     logger.info(f"Number of optimized Linear layers: {optimized_count}")
     return state_dict

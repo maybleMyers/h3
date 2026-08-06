@@ -427,7 +427,7 @@ def _load_int8_transformer(
     permutations (exact for int8 rows + per-row scales), the curve table and the tiny
     curve-form AdaLN projections stay float32 (matching the export's own runtime), and
     quantized Linears are monkey-patched to dequantize per forward (or run torch._int_mm)."""
-    from utils.safetensors_utils import MemoryEfficientSafeOpen
+    from utils.safetensors_utils import stream_safetensors
 
     from .int8_quant import (
         apply_int8_monkey_patch,
@@ -451,12 +451,7 @@ def _load_int8_transformer(
     # int8 tensors cannot carry grads; must be flipped before load_state_dict(assign=True)
     model.requires_grad_(False)
 
-    def stream_tensors():
-        with MemoryEfficientSafeOpen(checkpoint_path) as f:
-            for key in f.keys():
-                yield key, f.get_tensor(key)
-
-    sd, quant_map = convert_int8_dit_state_dict(stream_tensors())
+    sd, quant_map = convert_int8_dit_state_dict(stream_safetensors(checkpoint_path))
 
     # dtype policy: int8 weights and their float32 scales stay untouched; the mixed-precision
     # float32 islands (patch projections, output heads) stay float32; the curve table and the

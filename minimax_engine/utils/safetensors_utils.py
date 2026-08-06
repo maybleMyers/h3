@@ -1,8 +1,11 @@
+import itertools
 import os
 import re
 import torch
 import json
 import struct
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, Union, Optional
 
 from safetensors.torch import load_file
@@ -108,9 +111,13 @@ class MemoryEfficientSafeOpen:
         if offset_start == offset_end:
             tensor_bytes = None
         else:
-            # adjust offset by header size
+            # adjust offset by header size; readinto a preallocated bytearray so
+            # _deserialize_tensor can wrap it without a second copy
             self.file.seek(self.header_size + 8 + offset_start)
-            tensor_bytes = self.file.read(offset_end - offset_start)
+            tensor_bytes = bytearray(offset_end - offset_start)
+            n = self.file.readinto(tensor_bytes)
+            if n != len(tensor_bytes):
+                raise IOError(f"short read for tensor '{key}' in {self.filename}")
 
         return self._deserialize_tensor(tensor_bytes, metadata)
 
@@ -126,7 +133,8 @@ class MemoryEfficientSafeOpen:
         if tensor_bytes is None:
             byte_tensor = torch.empty(0, dtype=torch.uint8)
         else:
-            tensor_bytes = bytearray(tensor_bytes)  # make it writable
+            if not isinstance(tensor_bytes, bytearray):
+                tensor_bytes = bytearray(tensor_bytes)  # make it writable
             byte_tensor = torch.frombuffer(tensor_bytes, dtype=torch.uint8)
 
         # process float8 types
@@ -170,6 +178,71 @@ class MemoryEfficientSafeOpen:
             raise ValueError(f"Unsupported float8 type: {dtype_str} (upgrade PyTorch to support float8 types)")
 
 
+def _default_read_threads() -> int:
+    try:
+        return max(1, int(os.environ.get("H3_LOAD_THREADS", "8")))
+    except ValueError:
+        return 8
+
+
+def stream_safetensors(path: str, num_threads: Optional[int] = None, read_ahead: Optional[int] = None):
+    """Yield (key, tensor) pairs from a .safetensors file in header order.
+
+    Reads are fanned out over a thread pool using positional reads (os.preadv on a shared
+    fd, which releases the GIL), so an NVMe sees queue depth ~num_threads instead of the
+    single-threaded QD1 of MemoryEfficientSafeOpen.get_tensor. Tensors are still yielded
+    in file order, so per-tensor consumers (LoRA merge hooks, fp8 quantization) behave
+    identically. At most `read_ahead` tensors are in flight, bounding transient RAM.
+
+    num_threads defaults to $H3_LOAD_THREADS or 8; set to 1 (or run on a platform
+    without os.preadv) for the sequential fallback.
+    """
+    if num_threads is None:
+        num_threads = _default_read_threads()
+    with MemoryEfficientSafeOpen(path) as f:
+        keys = f.keys()
+        if num_threads <= 1 or not hasattr(os, "preadv"):
+            for key in keys:
+                yield key, f.get_tensor(key)
+            return
+
+        data_start = f.header_size + 8
+        fd = os.open(path, os.O_RDONLY)
+        try:
+
+            def read_entry(key):
+                offset_start, offset_end = f.header[key]["data_offsets"]
+                length = offset_end - offset_start
+                if length == 0:
+                    return None
+                buf = bytearray(length)
+                view = memoryview(buf)
+                pos = 0
+                while pos < length:
+                    n = os.preadv(fd, [view[pos:]], data_start + offset_start + pos)
+                    if n <= 0:
+                        raise IOError(f"short read for tensor '{key}' in {path}")
+                    pos += n
+                return buf
+
+            if read_ahead is None:
+                read_ahead = num_threads * 4
+            with ThreadPoolExecutor(max_workers=num_threads) as pool:
+                key_iter = iter(keys)
+                pending = deque(
+                    (key, pool.submit(read_entry, key)) for key in itertools.islice(key_iter, read_ahead)
+                )
+                while pending:
+                    key, future = pending.popleft()
+                    buf = future.result()
+                    next_key = next(key_iter, None)
+                    if next_key is not None:
+                        pending.append((next_key, pool.submit(read_entry, next_key)))
+                    yield key, f._deserialize_tensor(buf, f.header[key])
+        finally:
+            os.close(fd)
+
+
 def load_safetensors(
     path: str, device: Union[str, torch.device], disable_mmap: bool = False, dtype: Optional[torch.dtype] = None
 ) -> dict[str, torch.Tensor]:
@@ -188,13 +261,10 @@ def load_safetensors(
         return total_state_dict
 
     if disable_mmap:
-        # return safetensors.torch.load(open(path, "rb").read())
-        # use experimental loader
-        # logger.info(f"Loading without mmap (experimental)")
+        # parallel positional reads; see stream_safetensors
         state_dict = {}
-        with MemoryEfficientSafeOpen(path) as f:
-            for key in f.keys():
-                state_dict[key] = f.get_tensor(key).to(device, dtype=dtype)
+        for key, value in stream_safetensors(path):
+            state_dict[key] = value.to(device, dtype=dtype)
         return state_dict
     else:
         try:
