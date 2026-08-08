@@ -868,9 +868,17 @@ def run_chain(args, base_task, device):
     extra_ref = sample_rate = None
 
     if args.chain_extend:
-        source = MiniMaxH3Reference(video=args.chain_extend)
+        source = MiniMaxH3Reference(video=args.chain_extend, match_canvas=True)
+        if args.video_size is None:
+            from minimax_video.packing import MINIMAX_H3_MAX_PIXELS
+
+            height, width = source.video.shape[1], source.video.shape[2]
+            scale = min(1.0, (MINIMAX_H3_MAX_PIXELS / (height * width)) ** 0.5)
+            args.video_size = [max(32, round(height * scale / 32) * 32),
+                               max(32, round(width * scale / 32) * 32)]
+            logger.info(f"canvas matched to the source video: {args.video_size[1]}x{args.video_size[0]}")
         if args.chain_mode == "last_frame":
-            extra_ref = MiniMaxH3Reference(image=Image.fromarray(source.video[-1]))
+            extra_ref = MiniMaxH3Reference(image=Image.fromarray(source.video[-1]), match_canvas=True)
             del source
         else:
             extra_ref = source
@@ -894,10 +902,10 @@ def run_chain(args, base_task, device):
             break
         if i + 1 < args.chain_count:
             if args.chain_mode == "last_frame":
-                extra_ref = MiniMaxH3Reference(image=Image.fromarray(frames[-1]))
+                extra_ref = MiniMaxH3Reference(image=Image.fromarray(frames[-1]), match_canvas=True)
             else:
                 extra_ref = MiniMaxH3Reference(video=frames, audio=waveform[0].detach().cpu(),
-                                               sample_rate=sample_rate)
+                                               sample_rate=sample_rate, match_canvas=True)
         clean_memory_on_device(device)
 
     # One encode + one mux: raw waveforms are concatenated so the seams carry no AAC padding.

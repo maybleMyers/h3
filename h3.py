@@ -1531,7 +1531,8 @@ with gr.Blocks(
                         gr.Markdown(
                             "*Extension mode: the video above seeds the chain (same carry-over logic) and is "
                             "prepended to the joined output — handy for testing which prompt/mode continues "
-                            "best. 1 segment = a single continuation.*"
+                            "best. 1 segment = a single continuation. With Width/Height blank the canvas "
+                            "matches the source video's resolution (×32, capped at the model's max area).*"
                         )
                         minimax_chain_mode = gr.Radio(
                             choices=[("Last frame (image reference — cheap)", "last_frame"),

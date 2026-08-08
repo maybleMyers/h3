@@ -225,7 +225,7 @@ class MiniMaxH3Pipeline:
         if height is None:
             height, width = resolve_canvas_size(16, 9)
 
-        prepared, num_frames = self._prepare_references(references, num_frames)
+        prepared, num_frames = self._prepare_references(references, num_frames, min(height, width))
         num_latent_frames, latent_height, latent_width, num_audio_latents = self._latent_geometry(
             height, width, num_frames
         )
@@ -242,7 +242,7 @@ class MiniMaxH3Pipeline:
         )
 
     def _prepare_references(
-        self, references: list[MiniMaxH3Reference], num_frames: int | None
+        self, references: list[MiniMaxH3Reference], num_frames: int | None, canvas_short_edge: int | None = None
     ) -> tuple[list[MiniMaxH3PreparedReference], int]:
         """Port of MiniMaxH3Ref2VASetupStep.prepare_references."""
         resolved = [
@@ -276,16 +276,17 @@ class MiniMaxH3Pipeline:
         num_frames = align_num_frames(num_frames)
 
         for reference, entry in zip(resolved, references):
+            short_edge = canvas_short_edge if getattr(entry, "match_canvas", False) else None
             if reference.kind == "image":
                 image = entry.image
                 if not isinstance(image, Image.Image):
                     image = Image.fromarray(reference_media_to_uint8(image))
                 image = ImageOps.exif_transpose(image).convert("RGB")
-                ref_height, ref_width = resolve_reference_image_size(*image.size)
+                ref_height, ref_width = resolve_reference_image_size(*image.size, short_edge=short_edge)
                 reference.image = prepare_reference_image(image, ref_height, ref_width)
             elif reference.kind == "video":
                 frames = resample_reference_frames(reference_media_to_uint8(entry.video), float(entry.fps))
-                reference.frames = prepare_reference_frames(frames, num_frames)
+                reference.frames = prepare_reference_frames(frames, num_frames, short_edge=short_edge)
             if reference.has_audio:
                 reference.waveform = prepare_reference_waveform(
                     entry.audio,

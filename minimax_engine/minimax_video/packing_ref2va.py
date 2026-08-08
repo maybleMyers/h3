@@ -274,6 +274,10 @@ class MiniMaxH3Reference:
     fps: float | None = None
     audio: str | os.PathLike | torch.Tensor | None = None
     sample_rate: int | None = None
+    # h3 extension: encode this reference at the target canvas's short edge instead of the
+    # native reference resolution (768 video / 2048 image) — used for chain carry-over refs
+    # so a low-resolution target is not conditioned on a much larger reference.
+    match_canvas: bool = False
 
     def __post_init__(self):
         # A video reference conditions on its soundtrack too, so `audio` is a second medium of a video reference.
@@ -553,7 +557,7 @@ def build_ref2va_packed_sequence(
     )
 
 
-def resolve_reference_image_size(width: int, height: int) -> tuple[int, int]:
+def resolve_reference_image_size(width: int, height: int, short_edge: int | None = None) -> tuple[int, int]:
     r"""
     Resolve the resolution a reference image is encoded at: a 2048 pixel short edge, both axes rounded to a multiple
     of 32. Upscaling is intended, and unlike the target canvas there is no area cap.
@@ -570,7 +574,7 @@ def resolve_reference_image_size(width: int, height: int) -> tuple[int, int]:
     if width > 4 * height or height > 4 * width:
         raise ValueError(f"A reference image must be within 1:4 and 4:1, got {width}x{height}.")
 
-    scale = MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE / min(width, height)
+    scale = (short_edge or MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE) / min(width, height)
     multiple = MINIMAX_H3_CANVAS_MULTIPLE
     return (
         max(multiple, round(height * scale / multiple) * multiple),
@@ -653,7 +657,7 @@ def resample_reference_frames(frames: np.ndarray, fps: float) -> np.ndarray:
     return np.repeat(frames, np.diff(slots, append=math.floor(frames.shape[0] * scale + 0.5)), axis=0)
 
 
-def prepare_reference_frames(frames: np.ndarray, num_frames: int) -> np.ndarray:
+def prepare_reference_frames(frames: np.ndarray, num_frames: int, short_edge: int | None = None) -> np.ndarray:
     r"""
     Put a reference video onto the canvas its own aspect ratio resolves to, and cap it at the generated frame count.
 
@@ -675,7 +679,12 @@ def prepare_reference_frames(frames: np.ndarray, num_frames: int) -> np.ndarray:
             f"A reference video must be `(num_frames, height, width, 3)` RGB frames, got {tuple(frames.shape)}."
         )
     frames = frames[:num_frames]
-    height, width = resolve_canvas_size(frames.shape[2], frames.shape[1])
+    if short_edge is None:
+        height, width = resolve_canvas_size(frames.shape[2], frames.shape[1])
+    else:
+        scale = short_edge / min(frames.shape[1], frames.shape[2])
+        height = max(32, round(frames.shape[1] * scale / 32) * 32)
+        width = max(32, round(frames.shape[2] * scale / 32) * 32)
     if frames.shape[1:3] == (height, width):
         return frames
     return np.stack(
