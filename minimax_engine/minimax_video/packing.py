@@ -62,7 +62,7 @@ MINIMAX_H3_CANVAS_MULTIPLE = 32
 MINIMAX_H3_MIN_ASPECT_RATIO = 1 / 4
 MINIMAX_H3_MAX_ASPECT_RATIO = 4
 MINIMAX_H3_MIN_DURATION = 4.0
-MINIMAX_H3_MAX_DURATION = 15.0
+MINIMAX_H3_MAX_DURATION = 30.0
 
 # The video VAE encodes 17 pixel frames per chunk and drops the 3 trailing latent frames of every chunk, so
 # `17 * n + 5` pixel frames map to `5 * n + 2` latent frames.

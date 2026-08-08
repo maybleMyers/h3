@@ -99,6 +99,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--audio_flow_shift", type=float, default=None, help="audio sigma shift (checkpoint: 3.0)")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--num_outputs", type=int, default=1)
+    parser.add_argument("--chain_count", type=int, default=1,
+                        help=">1: generate that many segments and join them into one video")
+    parser.add_argument("--chain_mode", type=str, default="last_frame", choices=["last_frame", "video"],
+                        help="carry-over conditioning for segments after the first: the previous segment's "
+                             "last frame as an image reference, or the whole segment as a video reference")
+    parser.add_argument("--chain_keep_segments", action="store_true",
+                        help="also write each segment as its own mp4 next to the joined video")
+    parser.add_argument("--chain_extend", type=str, default=None,
+                        help="extension mode: seed the chain from this existing video instead of generating "
+                             "the first segment cold, and prepend it to the joined output")
 
     # Performance
     parser.add_argument("--device", type=str, default=None)
@@ -634,7 +644,7 @@ def decode_only(args, device):
 # ---------------------------------------------------------------------------
 
 
-def run_one(args, task, device, seed):
+def run_one(args, task, device, seed, extra_references=None):
     from minimax_video.model_loader import load_audio_vae, load_vae
 
     pipe = build_pipeline_shell(args, device)
@@ -652,6 +662,8 @@ def run_one(args, task, device, seed):
     image = Image.open(args.image_path) if args.image_path else None
     last_image = Image.open(args.last_image_path) if args.last_image_path else None
     references = build_references(args) if task == "ref2va" else None
+    if extra_references:
+        references = (references or []) + list(extra_references)
     num_frames = args.video_length if args.video_length else None
 
     plan = pipe.setup(
@@ -759,6 +771,163 @@ def run_one(args, task, device, seed):
     return plan, video_latents, audio_latent_tensor, frames, waveform, sample_rate, stopped_early
 
 
+def save_chain_segment(args, task, seed, plan, video_latents, audio_latents, frames, waveform, sample_rate,
+                       base: str, clip_index: int):
+    clip_base = f"{base}_clip{clip_index + 1}"
+    metadata = None if args.no_metadata else build_metadata(args, task, seed, plan)
+
+    if args.output_type in ("latent", "both") and video_latents is not None:
+        mem_eff_save_file(
+            {
+                "latent": video_latents.detach().cpu().contiguous(),
+                "audio_latent": audio_latents.detach().cpu().contiguous(),
+            },
+            clip_base + "_latent.safetensors",
+            metadata=metadata,
+        )
+        logger.info(f"saved: {clip_base}_latent.safetensors")
+
+    if args.chain_keep_segments and frames is not None:
+        video_path = clip_base + ".mp4"
+        save_video(frames, video_path, fps=24)
+        if waveform is not None:
+            wav_path = clip_base + ".wav"
+            save_audio_wav(waveform, wav_path, sample_rate)
+            final = mux_audio(video_path, wav_path, clip_base + "_audio.mp4")
+            if final != video_path and os.path.exists(final):
+                os.replace(final, video_path)
+            if os.path.exists(wav_path):
+                os.remove(wav_path)
+        logger.info(f"saved: {video_path}")
+
+
+def _ffprobe_csv(path: str, *probe_args) -> str:
+    result = subprocess.run(["ffprobe", "-v", "error", *probe_args, "-of", "csv=p=0", path],
+                            capture_output=True, text=True)
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def join_with_source(source_path: str, continuation_path: str, out_path: str,
+                     width: int, height: int, sample_rate: int) -> bool:
+    """Re-encode concat of the source video and the generated continuation, scaling the source
+    onto the generated canvas and its audio onto the audio VAE's rate."""
+    src_audio = _ffprobe_csv(source_path, "-select_streams", "a:0",
+                             "-show_entries", "stream=codec_type") == "audio"
+    cont_audio = _ffprobe_csv(continuation_path, "-select_streams", "a:0",
+                              "-show_entries", "stream=codec_type") == "audio"
+
+    v0 = f"[0:v]fps=24,scale={width}:{height}:flags=lanczos,setsar=1,format=yuv420p[v0]"
+    aformat = f"aformat=sample_rates={sample_rate}:channel_layouts=stereo"
+    if src_audio and cont_audio:
+        graph = (f"{v0};[0:a]{aformat}[a0];[1:a]{aformat}[a1];"
+                 f"[v0][a0][1:v][a1]concat=n=2:v=1:a=1[v][a]")
+        maps = ["-map", "[v]", "-map", "[a]"]
+    elif cont_audio:
+        delay_ms = int(float(_ffprobe_csv(source_path, "-show_entries", "format=duration") or 0) * 1000)
+        graph = f"{v0};[v0][1:v]concat=n=2:v=1:a=0[v];[1:a]{aformat},adelay={delay_ms}:all=1[a]"
+        maps = ["-map", "[v]", "-map", "[a]"]
+    else:
+        graph = f"{v0};[v0][1:v]concat=n=2:v=1:a=0[v]"
+        maps = ["-map", "[v]"]
+
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", source_path, "-i", continuation_path,
+           "-filter_complex", graph, *maps, "-c:v", "libx264", "-crf", "16", "-pix_fmt", "yuv420p"]
+    if "[a]" in maps[-1]:
+        cmd.extend(["-c:a", "aac", "-b:a", "192k"])
+    cmd.append(out_path)
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.error(f"ffmpeg concat with source failed: {result.stderr.strip()}")
+        return False
+    return True
+
+
+def run_chain(args, base_task, device):
+    """Generate --chain_count segments and join them into one video. Every segment keeps the
+    user's references; segments after the first also condition on the previous segment
+    (--chain_mode: its last frame as an image reference, or the whole clip as a video one).
+    With --chain_extend, an existing video seeds the chain the same way and is prepended
+    to the joined output."""
+    from minimax_video.packing_ref2va import MiniMaxH3Reference
+
+    if not args.video_length:
+        raise ValueError("chaining needs an explicit --video_length per segment")
+    if args.num_outputs != 1:
+        logger.warning("chaining forces --num_outputs 1")
+        args.num_outputs = 1
+    if args.prompt_cache:
+        logger.warning("prompt cache disabled while chaining: per-segment references change")
+        args.prompt_cache = None
+    if args.output_type == "latent":
+        logger.warning("chaining needs decoded frames; using --output_type both")
+        args.output_type = "both"
+
+    base_seed = args.seed
+    base = output_base(args, base_task, base_seed, 0)
+    all_frames, all_waveforms = [], []
+    extra_ref = sample_rate = None
+
+    if args.chain_extend:
+        source = MiniMaxH3Reference(video=args.chain_extend)
+        if args.chain_mode == "last_frame":
+            extra_ref = MiniMaxH3Reference(image=Image.fromarray(source.video[-1]))
+            del source
+        else:
+            extra_ref = source
+
+    for i in range(args.chain_count):
+        print(f"=== Generating clip {i + 1}/{args.chain_count} ===", flush=True)
+        task = "ref2va" if extra_ref is not None else base_task
+        plan, video_latents, audio_latents, frames, waveform, sample_rate, stopped_early = run_one(
+            args, task, device, base_seed + i,
+            extra_references=[extra_ref] if extra_ref is not None else None,
+        )
+        if i == 0 and args.video_size is None:
+            args.video_size = [plan.height, plan.width]  # pin the auto canvas for all later segments
+        all_frames.append(frames)
+        all_waveforms.append(waveform)
+        save_chain_segment(args, task, base_seed + i, plan, video_latents, audio_latents,
+                           frames, waveform, sample_rate, base, i)
+        del video_latents, audio_latents
+        if stopped_early:
+            logger.info(f"stop requested in clip {i + 1}: joining the segments generated so far")
+            break
+        if i + 1 < args.chain_count:
+            if args.chain_mode == "last_frame":
+                extra_ref = MiniMaxH3Reference(image=Image.fromarray(frames[-1]))
+            else:
+                extra_ref = MiniMaxH3Reference(video=frames, audio=waveform[0].detach().cpu(),
+                                               sample_rate=sample_rate)
+        clean_memory_on_device(device)
+
+    # One encode + one mux: raw waveforms are concatenated so the seams carry no AAC padding.
+    final_path = base + ".mp4"
+    video_path = (base + "_continuation.mp4") if args.chain_extend else final_path
+    stem = os.path.splitext(video_path)[0]
+    joined = np.concatenate(all_frames, axis=0)
+    save_video(joined, video_path, fps=24)
+    if all(w is not None for w in all_waveforms):
+        wav_path = args.audio_save_path or (stem + ".wav")
+        save_audio_wav(torch.cat([w.detach().float().cpu() for w in all_waveforms], dim=-1),
+                       wav_path, sample_rate)
+        final = mux_audio(video_path, wav_path, stem + "_audio.mp4")
+        if final != video_path and os.path.exists(final):
+            os.replace(final, video_path)
+        if args.audio_save_path is None and os.path.exists(wav_path):
+            os.remove(wav_path)
+
+    if args.chain_extend:
+        height, width = joined.shape[1], joined.shape[2]
+        if join_with_source(args.chain_extend, video_path, final_path, width, height,
+                            int(sample_rate) if sample_rate else 32000):
+            if not args.chain_keep_segments and os.path.exists(video_path):
+                os.remove(video_path)
+        else:
+            logger.warning("keeping the continuation alone as the output")
+            os.replace(video_path, final_path)
+    print(f"Video saved to: {final_path}", flush=True)
+
+
 def main():
     args = parse_args()
     device = torch.device(args.device) if args.device else torch.device(
@@ -781,6 +950,11 @@ def main():
         args.seed = random.randint(0, 2**31 - 1)
 
     start = time.time()
+    if args.chain_count > 1 or args.chain_extend:
+        run_chain(args, task, device)
+        logger.info(f"done in {time.time() - start:.1f}s")
+        return
+
     for i in range(args.num_outputs):
         seed = args.seed + i
         plan, video_latents, audio_latents, frames, waveform, sample_rate, _ = run_one(args, task, device, seed)

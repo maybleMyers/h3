@@ -211,9 +211,9 @@ def minimax_align_num_frames(num_frames: int) -> int:
     return num_frames
 
 
-# The encodable 17n+5 frame counts inside the released 4-15 s window (107..345 @ 24 fps).
+# The encodable 17n+5 frame counts inside the 4-30 s window (107..719 @ 24 fps).
 MINIMAX_VIDEO_LENGTH_CHOICES = [("0 — derive from audio reference", 0)] + [
-    (f"{n} frames ({n / 24:.2f} s)", n) for n in range(107, 346, 17)
+    (f"{n} frames ({n / 24:.2f} s)", n) for n in range(107, 721, 17)
 ]
 
 
@@ -244,6 +244,8 @@ def minimax_assemble_template_prompt(
     sections = []
 
     if task_name == "ref2va":
+        # Ref2VA sections put the content on the line after the label
+        # (base-mode sections keep it on the same line).
         for field, value in (
             ("subject_definitions", clean(subjects)),
             ("summary", clean(summary)),
@@ -252,7 +254,10 @@ def minimax_assemble_template_prompt(
         ):
             if not value:
                 raise gr.Error(f"Prompt Template: `{field}` is required for ref2va")
-            sections.append(f"{field}: {value}")
+            sections.append(f"{field}:\n{value}")
+        sections.append(f"overall_soundscape:\n{soundscape}")
+        sections.append(f"non_diegetic_music:\n{music}")
+        return "\n\n".join(sections)
     else:
         if not clean(imd):
             raise gr.Error("Prompt Template: `integrated_multimodal_description` is required")
@@ -444,6 +449,12 @@ def minimax_submit_to_queue(
     lora_folder: str,
     lora1_str: str, lora2_str: str, lora3_str: str, lora4_str: str,
     lora1_mult: float, lora2_mult: float, lora3_mult: float, lora4_mult: float,
+    # Chaining
+    chain_enable: bool = False,
+    chain_count: int = 2,
+    chain_mode: str = "last_frame",
+    chain_keep_segments: bool = False,
+    chain_extend_video: str = None,
 ) -> Tuple[str, List[str]]:
     """Submit MiniMax-H3 generation job(s) to the shared queue.
 
@@ -481,7 +492,14 @@ def minimax_submit_to_queue(
     else:
         task_name = "t2va"
 
-    if task_name == "ref2va" and not references:
+    chain_extend = str(chain_extend_video).strip() if chain_extend_video else ""
+    chaining = bool(chain_enable) and (int(chain_count) >= 2 or bool(chain_extend))
+    if bool(chain_enable) and not chaining:
+        raise gr.Error("Chaining with 1 segment needs an Extend video")
+    if chaining and chain_extend and not os.path.exists(chain_extend):
+        raise gr.Error(f"Extend video not found: {chain_extend}")
+
+    if task_name == "ref2va" and not references and not (chaining and chain_extend):
         raise gr.Error("ref2va needs at least one reference file")
     ref_kinds = []
     for path in references:
@@ -494,17 +512,34 @@ def minimax_submit_to_queue(
     if len(ref_kinds) > 12:
         raise gr.Error(f"MiniMax-H3 accepts at most 12 references, got {len(ref_kinds)}")
 
-    # Frame count: 17n+5 at 24 fps, 4-15 s. 0/blank on ref2va = derive from the audio reference.
+    # Chaining: one job runs chain_count segments and joins them; the carry-over reference
+    # needs headroom under the per-kind limits.
+    if chaining:
+        if int(num_outputs) > 1:
+            raise gr.Error("Chaining produces one joined video per job; set Num Outputs to 1 "
+                           "(use Batch Count for multiple chains)")
+        if chain_mode == "last_frame" and ref_kinds.count("image") > 8:
+            raise gr.Error("Chaining (last frame) adds an image reference per segment: at most 8 "
+                           "image references")
+        if chain_mode == "video" and ref_kinds.count("video") > 2:
+            raise gr.Error("Chaining (previous video) adds a video reference per segment: at most 2 "
+                           "video references")
+        if len(ref_kinds) > 11:
+            raise gr.Error("Chaining adds a reference per segment: at most 11 references")
+
+    # Frame count: 17n+5 at 24 fps, 4-30 s. 0/blank on ref2va = derive from the audio reference.
     video_length = opt_number(video_length)
     if video_length is not None:
         video_length = minimax_align_num_frames(video_length)
-        if not 107 <= video_length <= 345:
+        if not 107 <= video_length <= 719:
             raise gr.Error(
-                f"MiniMax-H3 generates 4-15 seconds at 24 fps: video length (snapped to 17n+5) must be "
-                f"107-345 frames, got {video_length}"
+                f"MiniMax-H3 generates 4-30 seconds at 24 fps: video length (snapped to 17n+5) must be "
+                f"107-719 frames, got {video_length}"
             )
     elif task_name != "ref2va":
         video_length = 124
+    if chaining and video_length is None:
+        raise gr.Error("Chaining needs an explicit per-segment Video Length")
 
     # Explicit pixel dimensions (both set) override the auto canvas; multiples of 32.
     width = opt_number(width)
@@ -561,6 +596,13 @@ def minimax_submit_to_queue(
         if width is not None and height is not None:
             command.extend(["--video_size", str(height), str(width)])
 
+        if chaining:
+            command.extend(["--chain_count", str(int(chain_count)), "--chain_mode", str(chain_mode)])
+            if chain_keep_segments:
+                command.append("--chain_keep_segments")
+            if chain_extend:
+                command.extend(["--chain_extend", chain_extend])
+
         if current_seed >= 0:
             command.extend(["--seed", str(current_seed)])
 
@@ -611,7 +653,7 @@ def minimax_submit_to_queue(
             command.extend(["--text_encoder_gpu_layers", str(int(te_layers))])
         if text_encoder_stream:
             command.append("--text_encoder_stream")
-        if prompt_cache:
+        if prompt_cache and not chaining:  # chain segments change references per segment; the cache key can't see that
             command.extend(["--prompt_cache", os.path.join(save_path, "minimax_prompt_cache.safetensors")])
 
         if enable_preview:
@@ -664,6 +706,12 @@ def minimax_submit_to_queue(
             parameters["last_image_path"] = last_image
         if references:
             parameters["references"] = references
+        if chaining:
+            parameters["chain_count"] = int(chain_count)
+            parameters["chain_mode"] = chain_mode
+            parameters["video_length"] = int(video_length) * int(chain_count)
+            if chain_extend:
+                parameters["chain_extend"] = chain_extend
 
         job = queue.add_job(
             command=command,
@@ -1451,7 +1499,7 @@ with gr.Blocks(
                         minimax_calc_width_btn = gr.Button("←")
                         minimax_height = gr.Number(label="Height (blank = auto; ×32)", value=None, step=32)
                     minimax_video_length = gr.Dropdown(
-                        label="Video Length (frames @ 24 fps; the VAE encodes 17n+5 frames, 4–15 s)",
+                        label="Video Length (frames @ 24 fps; the VAE encodes 17n+5 frames, 4–30 s)",
                         choices=MINIMAX_VIDEO_LENGTH_CHOICES,
                         value=124,
                     )
@@ -1466,6 +1514,35 @@ with gr.Blocks(
                     with gr.Row():
                         minimax_seed = gr.Number(label="Seed (-1 for random)", value=-1)
                         minimax_random_seed_btn = gr.Button("🎲")
+
+                    minimax_chain_enable = gr.Checkbox(
+                        label="Chaining", value=False,
+                        info="generate several segments of the length above and join them into one video. "
+                             "Every segment keeps your references; segments after the first also condition "
+                             "on the previous one. References lock identity/style, not exact frame "
+                             "continuity — seams read as matched cuts.",
+                    )
+                    with gr.Accordion("Chaining Options", open=True, visible=False) as minimax_chain_accordion:
+                        minimax_chain_count = gr.Slider(minimum=1, maximum=10, step=1, value=2,
+                                                        label="Segments (1 only when extending)")
+                        minimax_chain_extend_video = gr.Video(
+                            label="Extend existing video (optional)", sources=["upload"], height=200,
+                        )
+                        gr.Markdown(
+                            "*Extension mode: the video above seeds the chain (same carry-over logic) and is "
+                            "prepended to the joined output — handy for testing which prompt/mode continues "
+                            "best. 1 segment = a single continuation.*"
+                        )
+                        minimax_chain_mode = gr.Radio(
+                            choices=[("Last frame (image reference — cheap)", "last_frame"),
+                                     ("Previous video (video reference — strongest, carries audio, "
+                                      "~2x sequence length/VRAM)", "video")],
+                            value="last_frame", label="Carry-over conditioning",
+                        )
+                        minimax_chain_keep_segments = gr.Checkbox(
+                            label="Keep per-segment files", value=False,
+                            info="also write each segment as its own mp4 next to the joined video",
+                        )
 
                     with gr.Accordion("Advanced", open=False):
                         with gr.Row():
@@ -1962,6 +2039,12 @@ with gr.Blocks(
             minimax_lora_folder,
             *minimax_lora_weights,
             *minimax_lora_multipliers,
+            # Chaining
+            minimax_chain_enable,
+            minimax_chain_count,
+            minimax_chain_mode,
+            minimax_chain_keep_segments,
+            minimax_chain_extend_video,
         ],
         outputs=[minimax_output, minimax_preview_output, minimax_batch_progress, minimax_progress_text,
                  minimax_job_id_state, minimax_batch_id_state, minimax_poll_timer],
@@ -2147,6 +2230,12 @@ with gr.Blocks(
             outputs=minimax_template_vis_outputs,
         )
 
+    minimax_chain_enable.change(
+        fn=lambda enabled: gr.update(visible=bool(enabled)),
+        inputs=[minimax_chain_enable],
+        outputs=[minimax_chain_accordion],
+    )
+
     minimax_ui_default_components_ORDERED_LIST = [
         minimax_ckpt_dir,
         minimax_dit_path,
@@ -2182,6 +2271,10 @@ with gr.Blocks(
         minimax_use_taehv,
         minimax_preview_steps,
         minimax_preview_vae,
+        minimax_chain_enable,
+        minimax_chain_count,
+        minimax_chain_mode,
+        minimax_chain_keep_segments,
     ] + minimax_lora_weights + minimax_lora_multipliers
 
     minimax_ui_default_keys = [
@@ -2219,6 +2312,10 @@ with gr.Blocks(
         "minimax_use_taehv",
         "minimax_preview_steps",
         "minimax_preview_vae",
+        "minimax_chain_enable",
+        "minimax_chain_count",
+        "minimax_chain_mode",
+        "minimax_chain_keep_segments",
     ] + [f"minimax_lora_weight_{i+1}" for i in range(4)] + \
         [f"minimax_lora_multiplier_{i+1}" for i in range(4)]
 
@@ -2264,7 +2361,7 @@ with gr.Blocks(
                 try:
                     v = int(float(value_to_set))
                     value_to_set = 0 if v <= 0 else min(
-                        max(107, minimax_align_num_frames(v)), 345
+                        max(107, minimax_align_num_frames(v)), 719
                     )
                 except (TypeError, ValueError):
                     value_to_set = 124
@@ -2417,7 +2514,7 @@ with gr.Blocks(
             video_length = 0
         else:
             try:
-                video_length = min(max(107, minimax_align_num_frames(int(float(raw_length)))), 345)
+                video_length = min(max(107, minimax_align_num_frames(int(float(raw_length)))), 719)
             except (TypeError, ValueError):
                 video_length = 124
 
