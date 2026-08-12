@@ -452,9 +452,13 @@ def minimax_submit_to_queue(
     # Chaining
     chain_enable: bool = False,
     chain_count: int = 2,
-    chain_mode: str = "last_frame",
+    chain_mode: str = "motion",
     chain_keep_segments: bool = False,
     chain_extend_video: str = None,
+    chain_context_length: int = 22,
+    chain_context_encode: str = "video",
+    chain_audio_context: int = 0,
+    chain_audio_mode: str = "timeline",
 ) -> Tuple[str, List[str]]:
     """Submit MiniMax-H3 generation job(s) to the shared queue.
 
@@ -512,8 +516,8 @@ def minimax_submit_to_queue(
     if len(ref_kinds) > 12:
         raise gr.Error(f"MiniMax-H3 accepts at most 12 references, got {len(ref_kinds)}")
 
-    # Chaining: one job runs chain_count segments and joins them; the carry-over reference
-    # needs headroom under the per-kind limits.
+    # Chaining: one job runs chain_count segments and joins them. The reference carry-over modes need headroom under
+    # the per-kind limits; motion context is conditioning rows, not a reference, and consumes no slot.
     if chaining:
         if int(num_outputs) > 1:
             raise gr.Error("Chaining produces one joined video per job; set Num Outputs to 1 "
@@ -524,7 +528,7 @@ def minimax_submit_to_queue(
         if chain_mode == "video" and ref_kinds.count("video") > 2:
             raise gr.Error("Chaining (previous video) adds a video reference per segment: at most 2 "
                            "video references")
-        if len(ref_kinds) > 11:
+        if chain_mode != "motion" and len(ref_kinds) > 11:
             raise gr.Error("Chaining adds a reference per segment: at most 11 references")
 
     # Frame count: 17n+5 at 24 fps, 4-30 s. 0/blank on ref2va = derive from the audio reference.
@@ -540,6 +544,29 @@ def minimax_submit_to_queue(
         video_length = 124
     if chaining and video_length is None:
         raise gr.Error("Chaining needs an explicit per-segment Video Length")
+
+    # Motion context: the pinned run costs delivered frames, and every segment has to leave enough for the next.
+    chain_budget = ()
+    if chaining and chain_mode == "motion":
+        from minimax_video.motion_context import chain_frame_budget, motion_context_num_frames
+
+        try:
+            chain_span = motion_context_num_frames(int(chain_context_length))
+            chain_budget = chain_frame_budget(int(video_length), chain_span, int(chain_count),
+                                              extend=bool(chain_extend))
+        except ValueError as error:
+            raise gr.Error(str(error))
+        for index, delivered in enumerate(chain_budget[:-1]):
+            if delivered < chain_span:
+                raise gr.Error(
+                    f"Segment {index + 1} delivers {delivered} frames, fewer than the {chain_span} frame motion "
+                    f"context the next one needs. Raise Video Length or lower Context Length."
+                )
+        if chain_audio_context and int(chain_audio_context) > chain_span:
+            raise gr.Error(
+                f"Audio Context ({int(chain_audio_context)} frames) is wider than Context Length ({chain_span}); "
+                "the soundtrack window would land on the text rows. Use 0 to follow the video context."
+            )
 
     # Explicit pixel dimensions (both set) override the auto canvas; multiples of 32.
     width = opt_number(width)
@@ -598,6 +625,13 @@ def minimax_submit_to_queue(
 
         if chaining:
             command.extend(["--chain_count", str(int(chain_count)), "--chain_mode", str(chain_mode)])
+            if chain_mode == "motion":
+                command.extend([
+                    "--chain_context_length", str(int(chain_context_length)),
+                    "--chain_context_encode", str(chain_context_encode),
+                    "--chain_audio_context", str(int(chain_audio_context or 0)),
+                    "--chain_audio_mode", str(chain_audio_mode),
+                ])
             if chain_keep_segments:
                 command.append("--chain_keep_segments")
             if chain_extend:
@@ -653,7 +687,9 @@ def minimax_submit_to_queue(
             command.extend(["--text_encoder_gpu_layers", str(int(te_layers))])
         if text_encoder_stream:
             command.append("--text_encoder_stream")
-        if prompt_cache and not chaining:  # chain segments change references per segment; the cache key can't see that
+        # A reference-mode chain changes its references per segment and the cache key cannot see that. Motion context
+        # never reaches the conditioner, so a motion chain's prompt embeds are the same every segment.
+        if prompt_cache and (not chaining or chain_mode == "motion"):
             command.extend(["--prompt_cache", os.path.join(save_path, "minimax_prompt_cache.safetensors")])
 
         if enable_preview:
@@ -710,6 +746,11 @@ def minimax_submit_to_queue(
             parameters["chain_count"] = int(chain_count)
             parameters["chain_mode"] = chain_mode
             parameters["video_length"] = int(video_length) * int(chain_count)
+            if chain_mode == "motion":
+                parameters["chain_context_length"] = int(chain_context_length)
+                parameters["chain_context_encode"] = chain_context_encode
+                parameters["chain_audio_mode"] = chain_audio_mode
+                parameters["video_length"] = sum(chain_budget)
             if chain_extend:
                 parameters["chain_extend"] = chain_extend
 
@@ -1519,8 +1560,8 @@ with gr.Blocks(
                         label="Chaining", value=False,
                         info="generate several segments of the length above and join them into one video. "
                              "Every segment keeps your references; segments after the first also condition "
-                             "on the previous one. References lock identity/style, not exact frame "
-                             "continuity — seams read as matched cuts.",
+                             "on the previous one. Motion context continues the previous segment's motion; "
+                             "the reference modes lock identity/style only, so their seams read as cuts.",
                     )
                     with gr.Accordion("Chaining Options", open=True, visible=False) as minimax_chain_accordion:
                         minimax_chain_count = gr.Slider(minimum=1, maximum=10, step=1, value=2,
@@ -1535,11 +1576,36 @@ with gr.Blocks(
                             "matches the source video's resolution (×32, capped at the model's max area).*"
                         )
                         minimax_chain_mode = gr.Radio(
-                            choices=[("Last frame (image reference — cheap)", "last_frame"),
-                                     ("Previous video (video reference — strongest, carries audio, "
+                            choices=[("Motion context (true continuation — pins the previous segment's tail)",
+                                      "motion"),
+                                     ("Last frame (image reference — matched cut)", "last_frame"),
+                                     ("Previous video (video reference — matched cut, carries audio, "
                                       "~2x sequence length/VRAM)", "video")],
-                            value="last_frame", label="Carry-over conditioning",
+                            value="motion", label="Carry-over conditioning",
                         )
+                        with gr.Group(visible=True) as minimax_chain_motion_group:
+                            with gr.Row():
+                                minimax_chain_context_length = gr.Dropdown(
+                                    choices=[1, 5, 22, 39], value=22, label="Context Length (frames)",
+                                    info="the previous segment's tail pinned into the next one. 22 is the tested "
+                                         "balance; each segment delivers this many frames fewer.",
+                                )
+                                minimax_chain_audio_context = gr.Number(
+                                    label="Audio Context (frames, 0 = follow)", value=0, minimum=0, step=1,
+                                    info="a window wider than the video context risks landing on the text rows",
+                                )
+                            with gr.Row():
+                                minimax_chain_context_encode = gr.Radio(
+                                    choices=[("Video (one VAE call — motion lives in the latent)", "video"),
+                                             ("Frames (one call per frame — diagnostic)", "frames")],
+                                    value="video", label="Context Encode",
+                                )
+                                minimax_chain_audio_mode = gr.Radio(
+                                    choices=[("Timeline (continue the soundtrack)", "timeline"),
+                                             ("Off (audio restarts each segment)", "off")],
+                                    value="timeline", label="Audio Context",
+                                )
+                            minimax_chain_budget = gr.Markdown("")
                         minimax_chain_keep_segments = gr.Checkbox(
                             label="Keep per-segment files", value=False,
                             info="also write each segment as its own mp4 next to the joined video",
@@ -2046,6 +2112,10 @@ with gr.Blocks(
             minimax_chain_mode,
             minimax_chain_keep_segments,
             minimax_chain_extend_video,
+            minimax_chain_context_length,
+            minimax_chain_context_encode,
+            minimax_chain_audio_context,
+            minimax_chain_audio_mode,
         ],
         outputs=[minimax_output, minimax_preview_output, minimax_batch_progress, minimax_progress_text,
                  minimax_job_id_state, minimax_batch_id_state, minimax_poll_timer],
@@ -2237,6 +2307,33 @@ with gr.Blocks(
         outputs=[minimax_chain_accordion],
     )
 
+    def minimax_chain_budget_text(mode, count, length, context_length, extend):
+        if mode != "motion":
+            return ""
+        try:
+            from minimax_video.motion_context import chain_frame_budget, motion_context_num_frames
+            from minimax_video.packing import align_num_frames
+
+            raw = align_num_frames(int(length))
+            span = motion_context_num_frames(int(context_length))
+            budget = chain_frame_budget(raw, span, max(1, int(count)), extend=bool(extend))
+        except (ValueError, TypeError) as error:
+            return f"*⚠️ {error}*"
+        total = sum(budget)
+        return (f"*{max(1, int(count))} × {raw} frames generated → **{total} delivered** ({total / 24:.2f}s), "
+                f"{span} regenerated and trimmed per link.*")
+
+    minimax_chain_budget_inputs = [minimax_chain_mode, minimax_chain_count, minimax_video_length,
+                                   minimax_chain_context_length, minimax_chain_extend_video]
+    for _component in minimax_chain_budget_inputs:
+        _component.change(fn=minimax_chain_budget_text, inputs=minimax_chain_budget_inputs,
+                          outputs=[minimax_chain_budget])
+    minimax_chain_mode.change(
+        fn=lambda mode: gr.update(visible=mode == "motion"),
+        inputs=[minimax_chain_mode],
+        outputs=[minimax_chain_motion_group],
+    )
+
     minimax_ui_default_components_ORDERED_LIST = [
         minimax_ckpt_dir,
         minimax_dit_path,
@@ -2276,6 +2373,10 @@ with gr.Blocks(
         minimax_chain_count,
         minimax_chain_mode,
         minimax_chain_keep_segments,
+        minimax_chain_context_length,
+        minimax_chain_context_encode,
+        minimax_chain_audio_context,
+        minimax_chain_audio_mode,
     ] + minimax_lora_weights + minimax_lora_multipliers
 
     minimax_ui_default_keys = [
@@ -2317,6 +2418,10 @@ with gr.Blocks(
         "minimax_chain_count",
         "minimax_chain_mode",
         "minimax_chain_keep_segments",
+        "minimax_chain_context_length",
+        "minimax_chain_context_encode",
+        "minimax_chain_audio_context",
+        "minimax_chain_audio_mode",
     ] + [f"minimax_lora_weight_{i+1}" for i in range(4)] + \
         [f"minimax_lora_multiplier_{i+1}" for i in range(4)]
 

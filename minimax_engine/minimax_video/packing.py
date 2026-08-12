@@ -369,6 +369,105 @@ def _temporal_position_span(num_latent_frames: int) -> float:
     return float(spans.sum())
 
 
+def latent_pixel_frame_offsets(num_latent_frames: int) -> tuple[int, ...]:
+    r"""
+    The pixel-frame index every latent frame begins at: the running sum of `_ROPE_FRAMES_PER_LATENT`.
+
+    The integer counterpart of [`_temporal_position_grid`], and the anchor set a motion-context tail is pinned at.
+
+    Args:
+        num_latent_frames (`int`): The number of latent frames.
+
+    Returns:
+        `tuple[int, ...]`: One pixel-frame index per latent frame, e.g. `(0, 1, 5, 9, 13, 17, 18)` for seven.
+    """
+    offsets, cursor = [], 0
+    for index in range(num_latent_frames):
+        offsets.append(cursor)
+        cursor += _ROPE_FRAMES_PER_LATENT[index % len(_ROPE_FRAMES_PER_LATENT)]
+    return tuple(offsets)
+
+
+def latent_pixel_frame_count(num_latent_frames: int) -> int:
+    r"""
+    The number of pixel frames `num_latent_frames` latent frames cover, i.e. `_temporal_position_span` in frames.
+
+    Args:
+        num_latent_frames (`int`): The number of latent frames.
+
+    Returns:
+        `int`: The number of pixel frames covered.
+    """
+    return sum(
+        _ROPE_FRAMES_PER_LATENT[index % len(_ROPE_FRAMES_PER_LATENT)] for index in range(num_latent_frames)
+    )
+
+
+def condition_anchor_time(anchor: str | float, origin: float, num_latent_frames: int) -> float:
+    r"""
+    The rotary time of a conditioning block anchored at a pixel frame of a timeline starting at `origin`.
+
+    A latent frame spans `5/3 * frames_per_latent` rotary units and covers `frames_per_latent` pixel frames, so the
+    cumulative time at pixel frame `p` is exactly `5/3 * p`. `"first"` and `"last"` keep the released expressions
+    instead of that general form: the values are the same, but the summation orders differ in the last ulp, and an
+    existing first/last request has to keep building byte-identical positions.
+
+    Args:
+        anchor (`str` or `float`): `"first"`, `"last"`, or a pixel-frame index on the target timeline.
+        origin (`float`): The rotary time the timeline starts at.
+        num_latent_frames (`int`): Number of target latent frames, for the `"last"` anchor.
+
+    Returns:
+        `float`: The rotary time of the block.
+    """
+    if anchor == "first":
+        return origin
+    if anchor == "last":
+        return origin + _temporal_position_span(num_latent_frames) - _ROPE_FRAME_RESCALE
+    return origin + _ROPE_FRAME_RESCALE * float(anchor)
+
+
+def _validate_condition_anchors(anchors: tuple[str | float, ...], num_latent_frames: int) -> None:
+    r"""Reject anchors off the target timeline, and numeric anchors that do not run forwards."""
+    limit = latent_pixel_frame_count(num_latent_frames)
+    previous = None
+    for anchor in anchors:
+        if anchor in ("first", "last"):
+            continue
+        if not isinstance(anchor, (int, float)):
+            raise ValueError(f"A condition anchor must be 'first', 'last' or a pixel-frame index, got {anchor!r}.")
+        if not 0 <= anchor < limit:
+            raise ValueError(
+                f"A condition anchor sits at pixel frame {anchor:g}, outside the {limit} frames of the target."
+            )
+        if previous is not None and anchor <= previous:
+            raise ValueError(f"Condition anchors must run forwards, got {previous:g} then {anchor:g}.")
+        previous = anchor
+
+
+def _fill_audio_positions(
+    position_ids: torch.Tensor,
+    rows: slice,
+    num_audio_latents: int,
+    rotary_time: float,
+    width_grid: torch.Tensor,
+) -> None:
+    r"""
+    Place one channel-major audio block.
+
+    Audio rows carry no height coordinate and are pinned to the two extremes of the width grid of *their own* block —
+    the target grid for a standalone audio reference, the video's grid for a soundtrack.
+    """
+    time = rotary_time + torch.arange(num_audio_latents, dtype=torch.float64)
+    position_ids[rows, 0] = time.repeat(MINIMAX_H3_AUDIO_CHANNELS)
+    position_ids[rows, 2] = torch.cat(
+        [
+            torch.full((num_audio_latents,), float(width_grid[0]), dtype=torch.float64),
+            torch.full((num_audio_latents,), float(width_grid[-1]), dtype=torch.float64),
+        ]
+    )
+
+
 def build_packed_sequence(
     text_token_tags: torch.Tensor,
     num_latent_frames: int,
@@ -376,11 +475,12 @@ def build_packed_sequence(
     latent_width: int,
     num_audio_latents: int,
     patch_size: tuple[int, int, int],
-    keyframe_anchors: tuple[str, ...] = (),
+    keyframe_anchors: tuple[str | float, ...] = (),
+    audio_condition_windows: tuple[tuple[int, float], ...] = (),
 ) -> MiniMaxH3PackedSequence:
     r"""
-    Build the `[text | keyframe conditions | target audio | target video]` layout used by the `t2va` and `fl2va`
-    tasks.
+    Build the `[text | video conditions | audio conditions | target audio | target video]` layout used by the `t2va`
+    and `fl2va` tasks.
 
     Args:
         text_token_tags (`torch.Tensor` of shape `(num_text_tokens,)`):
@@ -391,9 +491,13 @@ def build_packed_sequence(
         latent_width (`int`): Target latent width.
         num_audio_latents (`int`): Number of target audio latents per channel.
         patch_size (`tuple[int, int, int]`): The transformer's `(t, h, w)` patch.
-        keyframe_anchors (`tuple[str, ...]`):
-            One entry per keyframe conditioning block, in packed order: `"first"` anchors the block at the first
-            latent frame, `"last"` at the last one.
+        keyframe_anchors (`tuple[str | float, ...]`):
+            One entry per video conditioning block, in packed order: `"first"` anchors the block at the first latent
+            frame, `"last"` at the last one, and a number at that pixel frame of the target timeline — the interior
+            anchors a motion-context tail is pinned at.
+        audio_condition_windows (`tuple[tuple[int, float], ...]`):
+            One `(num_latents, start_offset)` per audio conditioning block, in packed order, `start_offset` being
+            the rotary offset of the window's first latent from the target's own origin.
 
     Returns:
         [`MiniMaxH3PackedSequence`]
@@ -402,12 +506,16 @@ def build_packed_sequence(
     rows_per_frame = (latent_height // patch_h) * (latent_width // patch_w)
     num_text_tokens = text_token_tags.shape[0]
     num_condition_rows = len(keyframe_anchors) * rows_per_frame
+    num_audio_condition_rows = sum(count for count, _ in audio_condition_windows) * MINIMAX_H3_AUDIO_CHANNELS
     num_audio_rows = num_audio_latents * MINIMAX_H3_AUDIO_CHANNELS
     num_video_rows = num_latent_frames * rows_per_frame
-    sequence_length = num_text_tokens + num_condition_rows + num_audio_rows + num_video_rows
+    sequence_length = (
+        num_text_tokens + num_condition_rows + num_audio_condition_rows + num_audio_rows + num_video_rows
+    )
 
     condition_start = num_text_tokens
-    audio_start = condition_start + num_condition_rows
+    audio_condition_start = condition_start + num_condition_rows
+    audio_start = audio_condition_start + num_audio_condition_rows
     video_start = audio_start + num_audio_rows
 
     # 1. The (t, h, w) grid. Text rows sit on the time axis at their row index, and the media rows continue the time
@@ -420,26 +528,30 @@ def build_packed_sequence(
     width_grid = _spatial_position_grid(latent_width, patch_w, sqrt_area)
     frame_grid = torch.stack([grid.reshape(-1) for grid in torch.meshgrid(height_grid, width_grid, indexing="ij")], -1)
 
+    _validate_condition_anchors(keyframe_anchors, num_latent_frames)
     for index, anchor in enumerate(keyframe_anchors):
-        if anchor == "first":
-            anchor_time = float(num_text_tokens)
-        elif anchor == "last":
-            anchor_time = float(num_text_tokens) + _temporal_position_span(num_latent_frames) - _ROPE_FRAME_RESCALE
-        else:
-            raise ValueError(f"A keyframe anchor must be 'first' or 'last', got {anchor!r}.")
         rows = slice(condition_start + index * rows_per_frame, condition_start + (index + 1) * rows_per_frame)
-        position_ids[rows, 0] = anchor_time
+        position_ids[rows, 0] = condition_anchor_time(anchor, float(num_text_tokens), num_latent_frames)
         position_ids[rows, 1:] = frame_grid
+
+    # Audio conditioning windows are placed relative to the target's own origin, which on this layout is where the
+    # text rows end. A window may start marginally before it — the 40 Hz grid rounds to the nearest latent, so an
+    # end-aligned window lands up to a third of a unit early — but a full unit early would sit on the text rows.
+    cursor = audio_condition_start
+    for count, start_offset in audio_condition_windows:
+        if start_offset <= -1.0:
+            raise ValueError(
+                f"An audio conditioning window starts {-start_offset:g} rotary units before the target, where the "
+                "text rows sit. Shorten it to at most the video conditioning window."
+            )
+        rows = slice(cursor, cursor + count * MINIMAX_H3_AUDIO_CHANNELS)
+        cursor = rows.stop
+        _fill_audio_positions(position_ids, rows, count, float(num_text_tokens) + start_offset, width_grid)
 
     # Audio rows are channel-major and share the video's rotary clock: one unit per latent at 40 latents/s equals
     # 24 fps * 5/3. They carry no height coordinate and are pinned to the two extremes of the width grid.
-    audio_time = float(num_text_tokens) + torch.arange(num_audio_latents, dtype=torch.float64)
-    position_ids[audio_start:video_start, 0] = audio_time.repeat(MINIMAX_H3_AUDIO_CHANNELS)
-    position_ids[audio_start:video_start, 2] = torch.cat(
-        [
-            torch.full((num_audio_latents,), float(width_grid[0]), dtype=torch.float64),
-            torch.full((num_audio_rows - num_audio_latents,), float(width_grid[-1]), dtype=torch.float64),
-        ]
+    _fill_audio_positions(
+        position_ids, slice(audio_start, video_start), num_audio_latents, float(num_text_tokens), width_grid
     )
 
     video_position_ids = torch.empty(num_latent_frames, rows_per_frame, 3, dtype=torch.float64)
@@ -447,9 +559,12 @@ def build_packed_sequence(
     video_position_ids[:, :, 1:] = frame_grid[None]
     position_ids[video_start:] = video_position_ids.reshape(-1, 3)
 
-    # 2. Row indices and modality tags.
-    video_indices = torch.cat([torch.arange(condition_start, audio_start), torch.arange(video_start, sequence_length)])
-    audio_indices = torch.arange(audio_start, video_start)
+    # 2. Row indices and modality tags. Conditioning rows lead both media index tensors, which is the order
+    # `prepare_latents` concatenates their latents in.
+    video_indices = torch.cat(
+        [torch.arange(condition_start, audio_condition_start), torch.arange(video_start, sequence_length)]
+    )
+    audio_indices = torch.arange(audio_condition_start, video_start)
     text_indices = torch.arange(num_text_tokens)
 
     token_tags = torch.empty(sequence_length, dtype=torch.long)
@@ -465,7 +580,7 @@ def build_packed_sequence(
         audio_indices=audio_indices,
         text_indices=text_indices,
         num_condition_video_rows=num_condition_rows,
-        num_condition_audio_rows=0,
+        num_condition_audio_rows=num_audio_condition_rows,
     )
 
 

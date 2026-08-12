@@ -101,9 +101,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_outputs", type=int, default=1)
     parser.add_argument("--chain_count", type=int, default=1,
                         help=">1: generate that many segments and join them into one video")
-    parser.add_argument("--chain_mode", type=str, default="last_frame", choices=["last_frame", "video"],
-                        help="carry-over conditioning for segments after the first: the previous segment's "
-                             "last frame as an image reference, or the whole segment as a video reference")
+    parser.add_argument("--chain_mode", type=str, default="motion", choices=["motion", "last_frame", "video"],
+                        help="carry-over conditioning for segments after the first. motion: pin the previous "
+                             "segment's tail on the new segment's own timeline, so it continues rather than cuts. "
+                             "last_frame/video: carry the previous segment as a reference instead, which locks "
+                             "identity and style but reads as a matched cut")
+    parser.add_argument("--chain_context_length", type=int, default=22,
+                        help="--chain_mode motion: frames of the previous segment pinned into the next one. Snapped "
+                             "down to the video VAE grid (1, 5, 22, 39, ... i.e. 1 and every 17 * n + 5); each "
+                             "segment delivers that many frames fewer")
+    parser.add_argument("--chain_context_encode", type=str, default="video", choices=["video", "frames"],
+                        help="--chain_mode motion: encode the pinned run in one VAE call so the motion lives inside "
+                             "the temporal latent (video), or one call per frame (frames, a diagnostic: three times "
+                             "the rows for less information)")
+    parser.add_argument("--chain_context_crop", type=str, default="stretch", choices=["stretch", "center"],
+                        help="--chain_mode motion: how to fit an off-canvas tail, only reached by --chain_extend")
+    parser.add_argument("--chain_audio_context", type=int, default=0,
+                        help="--chain_mode motion: soundtrack window in frames; 0 follows --chain_context_length. "
+                             "A window wider than the video context risks landing on the text rows")
+    parser.add_argument("--chain_audio_mode", type=str, default="timeline", choices=["timeline", "off"],
+                        help="--chain_mode motion: pin the previous segment's soundtrack end-aligned with its "
+                             "picture (timeline), or let audio restart each segment (off)")
     parser.add_argument("--chain_keep_segments", action="store_true",
                         help="also write each segment as its own mp4 next to the joined video")
     parser.add_argument("--chain_extend", type=str, default=None,
@@ -644,7 +662,7 @@ def decode_only(args, device):
 # ---------------------------------------------------------------------------
 
 
-def run_one(args, task, device, seed, extra_references=None):
+def run_one(args, task, device, seed, extra_references=None, motion_context=None):
     from minimax_video.model_loader import load_audio_vae, load_vae
 
     pipe = build_pipeline_shell(args, device)
@@ -674,6 +692,8 @@ def run_one(args, task, device, seed, extra_references=None):
         image=image,
         last_image=last_image,
         references=references,
+        motion_context=motion_context,
+        audio_motion_mode=getattr(args, "chain_audio_mode", "timeline"),
     )
     logger.info(
         f"task={plan.task} size={plan.width}x{plan.height} frames={plan.num_frames} "
@@ -710,6 +730,7 @@ def run_one(args, task, device, seed, extra_references=None):
         generator=generator,
         condition_latents=condition_latents,
         audio_condition_latents=audio_condition_latents,
+        layout=layout,
     )
     timesteps, audio_timesteps, row_timestep_plan = pipe.set_timesteps(args.infer_steps, layout)
 
@@ -842,30 +863,80 @@ def join_with_source(source_path: str, continuation_path: str, out_path: str,
     return True
 
 
+def trim_chain_segment(frames, waveform, sample_rate, num_context_frames):
+    """Drop the regenerated pinned run off the front of a segment, picture and sound together.
+
+    Trimming only the picture would slide the whole soundtrack `num_context_frames / 24` seconds early, and matching
+    the tail keeps every segment exactly as long as its picture so the sample grid's rounding cannot accumulate."""
+    from minimax_video.motion_context import trim_segment_audio
+
+    frames = frames[num_context_frames:]
+    if waveform is None:
+        return frames, None
+    cut, want = trim_segment_audio(waveform.shape[-1], num_context_frames, frames.shape[0], sample_rate)
+    waveform = waveform[..., cut:]
+    if waveform.shape[-1] > want:
+        waveform = waveform[..., :want]
+    elif waveform.shape[-1] < want:
+        waveform = torch.nn.functional.pad(waveform, (0, want - waveform.shape[-1]))
+    return frames, waveform
+
+
 def run_chain(args, base_task, device):
-    """Generate --chain_count segments and join them into one video. Every segment keeps the
-    user's references; segments after the first also condition on the previous segment
-    (--chain_mode: its last frame as an image reference, or the whole clip as a video one).
-    With --chain_extend, an existing video seeds the chain the same way and is prepended
-    to the joined output."""
-    from minimax_video.packing_ref2va import MiniMaxH3Reference
+    """Generate --chain_count segments and join them into one video.
+
+    Under --chain_mode motion each segment after the first pins the previous segment's tail as conditioning rows on
+    its own timeline, regenerates those frames and has them trimmed back off, so the join is a continuation rather
+    than a cut. The older reference modes carry the previous segment as a reference instead. With --chain_extend an
+    existing video seeds the chain the same way and is prepended to the joined output."""
+    from minimax_video.motion_context import (
+        MiniMaxH3MotionContext,
+        chain_frame_budget,
+        motion_context_num_frames,
+    )
+    from minimax_video.packing import align_num_frames, audio_latent_num_frames
+    from minimax_video.packing_ref2va import MiniMaxH3Reference, resample_reference_frames
 
     if not args.video_length:
         raise ValueError("chaining needs an explicit --video_length per segment")
     if args.num_outputs != 1:
         logger.warning("chaining forces --num_outputs 1")
         args.num_outputs = 1
-    if args.prompt_cache:
-        logger.warning("prompt cache disabled while chaining: per-segment references change")
-        args.prompt_cache = None
     if args.output_type == "latent":
         logger.warning("chaining needs decoded frames; using --output_type both")
         args.output_type = "both"
 
+    motion_mode = args.chain_mode == "motion"
+    if not motion_mode and args.prompt_cache:
+        logger.warning("prompt cache disabled while chaining: per-segment references change")
+        args.prompt_cache = None
+
+    span = 0
+    if motion_mode:
+        # Everything the chain arithmetic depends on is checked before a single weight is loaded.
+        raw_frames = align_num_frames(args.video_length)
+        span = motion_context_num_frames(args.chain_context_length)
+        if span != args.chain_context_length:
+            logger.warning(
+                f"--chain_context_length {args.chain_context_length} is off the video VAE grid, using {span} "
+                "(the grid is 1 and every 17 * n + 5)"
+            )
+        budget = chain_frame_budget(raw_frames, span, args.chain_count, extend=bool(args.chain_extend))
+        for index, delivered in enumerate(budget[:-1]):
+            if delivered < span:
+                raise ValueError(
+                    f"segment {index + 1} delivers {delivered} frames, fewer than the {span} frame motion context "
+                    f"the next one needs. Raise --video_length or lower --chain_context_length."
+                )
+        logger.info(
+            f"motion context: {span} frames pinned per link, {sum(budget)} frames delivered "
+            f"({sum(budget) / 24:.2f}s) from {args.chain_count} x {raw_frames} generated"
+        )
+
     base_seed = args.seed
     base = output_base(args, base_task, base_seed, 0)
     all_frames, all_waveforms = [], []
-    extra_ref = sample_rate = None
+    extra_ref = motion_context = sample_rate = None
 
     if args.chain_extend:
         source = MiniMaxH3Reference(video=args.chain_extend, match_canvas=True)
@@ -877,35 +948,79 @@ def run_chain(args, base_task, device):
             args.video_size = [max(32, round(height * scale / 32) * 32),
                                max(32, round(width * scale / 32) * 32)]
             logger.info(f"canvas matched to the source video: {args.video_size[1]}x{args.video_size[0]}")
-        if args.chain_mode == "last_frame":
+        if motion_mode:
+            # An mp4 carries no H3 latent, so the tail is re-encoded through the same VAEs the links use; only this
+            # first seam pays for that.
+            frames = resample_reference_frames(source.video, float(source.fps))
+            motion_context = MiniMaxH3MotionContext(
+                frames=frames[-span:],
+                waveform=source.audio,
+                sample_rate=source.sample_rate,
+                previous_num_frames=frames.shape[0],
+                previous_num_audio_latents=audio_latent_num_frames(frames.shape[0]),
+                num_frames=span,
+                audio_num_frames=args.chain_audio_context,
+                encode_mode=args.chain_context_encode,
+                crop=args.chain_context_crop,
+            )
+            del source
+        elif args.chain_mode == "last_frame":
             extra_ref = MiniMaxH3Reference(image=Image.fromarray(source.video[-1]), match_canvas=True)
             del source
         else:
             extra_ref = source
 
+    keyframe_paths = (args.image_path, args.last_image_path)
     for i in range(args.chain_count):
         print(f"=== Generating clip {i + 1}/{args.chain_count} ===", flush=True)
         task = "ref2va" if extra_ref is not None else base_task
+        if motion_mode and any(keyframe_paths):
+            # A keyframe anchors the frame the motion context already pins, so the two would claim the same rotary
+            # coordinate with different pictures. Keyframes belong to the segment that starts the chain.
+            starts_cold = i == 0 and not args.chain_extend
+            args.image_path, args.last_image_path = keyframe_paths if starts_cold else (None, None)
+            if i == 0 and not starts_cold:
+                logger.info("keyframes dropped: --chain_extend makes the motion context the anchor of every clip")
+            elif i == 1:
+                logger.info("keyframes dropped from clip 2 on: the motion context anchors continuing clips")
         plan, video_latents, audio_latents, frames, waveform, sample_rate, stopped_early = run_one(
             args, task, device, base_seed + i,
             extra_references=[extra_ref] if extra_ref is not None else None,
+            motion_context=motion_context,
         )
         if i == 0 and args.video_size is None:
             args.video_size = [plan.height, plan.width]  # pin the auto canvas for all later segments
+        raw_num_frames, raw_num_audio_latents = plan.num_frames, plan.num_audio_latents
+        if motion_context is not None and frames is not None:
+            frames, waveform = trim_chain_segment(frames, waveform, sample_rate, plan.motion_context.num_frames)
         all_frames.append(frames)
         all_waveforms.append(waveform)
         save_chain_segment(args, task, base_seed + i, plan, video_latents, audio_latents,
                            frames, waveform, sample_rate, base, i)
-        del video_latents, audio_latents
+        del video_latents
         if stopped_early:
             logger.info(f"stop requested in clip {i + 1}: joining the segments generated so far")
             break
         if i + 1 < args.chain_count:
-            if args.chain_mode == "last_frame":
+            if motion_mode:
+                # The delivered tail carries the picture; the audio latents are the untrimmed ones, because the
+                # overhang is a property of the clip the VAE encoded and the trim only removes its front.
+                motion_context = MiniMaxH3MotionContext(
+                    frames=frames[-span:],
+                    audio_latents=audio_latents.detach().cpu(),
+                    previous_num_frames=raw_num_frames,
+                    previous_num_audio_latents=raw_num_audio_latents,
+                    num_frames=span,
+                    audio_num_frames=args.chain_audio_context,
+                    encode_mode=args.chain_context_encode,
+                    crop=args.chain_context_crop,
+                )
+            elif args.chain_mode == "last_frame":
                 extra_ref = MiniMaxH3Reference(image=Image.fromarray(frames[-1]), match_canvas=True)
             else:
                 extra_ref = MiniMaxH3Reference(video=frames, audio=waveform[0].detach().cpu(),
                                                sample_rate=sample_rate, match_canvas=True)
+        del audio_latents
         clean_memory_on_device(device)
 
     # One encode + one mux: raw waveforms are concatenated so the seams carry no AAC padding.

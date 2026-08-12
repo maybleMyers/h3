@@ -28,6 +28,7 @@ from diffusers.utils.torch_utils import randn_tensor
 
 from .packing import (
     MINIMAX_H3_AUDIO_CHANNELS,
+    MINIMAX_H3_AUDIO_LATENTS_PER_SECOND,
     MINIMAX_H3_CANVAS_MULTIPLE,
     MINIMAX_H3_FPS,
     MINIMAX_H3_KEYFRAME_ENCODE_SEED,
@@ -42,6 +43,7 @@ from .packing import (
     build_packed_sequence,
     build_row_timesteps,
     keyframe_condition_noise,
+    latent_pixel_frame_count,
     patchify_video_latents,
     prepare_keyframe_image,
     resolve_canvas_size,
@@ -49,6 +51,7 @@ from .packing import (
     unpatchify_video_tokens,
     video_latent_num_frames,
 )
+from .motion_context import MiniMaxH3MotionContext, resolve_motion_context
 from .packing_ref2va import (
     MINIMAX_H3_MAX_REFERENCE_AUDIOS,
     MINIMAX_H3_MAX_REFERENCE_IMAGES,
@@ -86,6 +89,7 @@ class MiniMaxH3Plan:
     keyframes: list = field(default_factory=list)
     keyframe_anchors: tuple = ()
     prepared_references: list = field(default_factory=list)
+    motion_context: MiniMaxH3MotionContext | None = None
 
 
 class MiniMaxH3Pipeline:
@@ -162,12 +166,14 @@ class MiniMaxH3Pipeline:
         image: Image.Image | None = None,
         last_image: Image.Image | None = None,
         references: list[MiniMaxH3Reference] | None = None,
+        motion_context: MiniMaxH3MotionContext | None = None,
+        audio_motion_mode: str = "timeline",
     ) -> MiniMaxH3Plan:
-        """Port of MiniMaxH3SetupStep / MiniMaxH3Ref2VASetupStep."""
+        """Port of MiniMaxH3SetupStep / MiniMaxH3Ref2VASetupStep, plus motion-context resolution."""
         self._check_canvas(height, width)
 
         if task == "ref2va":
-            return self._setup_ref2va(height, width, num_frames, references)
+            return self._setup_ref2va(height, width, num_frames, references, motion_context, audio_motion_mode)
 
         keyframes = [
             ImageOps.exif_transpose(keyframe).convert("RGB")
@@ -178,7 +184,13 @@ class MiniMaxH3Pipeline:
             anchor for anchor, keyframe in (("first", image), ("last", last_image)) if keyframe is not None
         )
         if height is None:
-            height, width = resolve_canvas_size(*(keyframes[0].size if keyframes else (16, 9)))
+            if keyframes:
+                height, width = resolve_canvas_size(*keyframes[0].size)
+            elif motion_context is not None and motion_context.frames is not None:
+                # A continuation inherits the canvas of the clip it continues.
+                height, width = resolve_canvas_size(motion_context.frames.shape[2], motion_context.frames.shape[1])
+            else:
+                height, width = resolve_canvas_size(16, 9)
 
         num_frames = self._check_duration(num_frames if num_frames else 124)
         num_latent_frames, latent_height, latent_width, num_audio_latents = self._latent_geometry(
@@ -188,6 +200,8 @@ class MiniMaxH3Pipeline:
             prepare_keyframe_image(keyframe, height, width, stretch=index == 0)
             for index, keyframe in enumerate(keyframes)
         ]
+        if motion_context is not None:
+            motion_context = resolve_motion_context(motion_context, height, width, num_frames, audio_motion_mode)
         return MiniMaxH3Plan(
             task="fl2va" if keyframes else "t2va",
             height=height,
@@ -199,9 +213,12 @@ class MiniMaxH3Pipeline:
             num_audio_latents=num_audio_latents,
             keyframes=keyframes,
             keyframe_anchors=keyframe_anchors,
+            motion_context=motion_context,
         )
 
-    def _setup_ref2va(self, height, width, num_frames, references) -> MiniMaxH3Plan:
+    def _setup_ref2va(
+        self, height, width, num_frames, references, motion_context=None, audio_motion_mode="timeline"
+    ) -> MiniMaxH3Plan:
         if not references:
             raise ValueError("`ref2va` needs at least one reference.")
         kinds = [reference_kind(index, entry) for index, entry in enumerate(references)]
@@ -223,12 +240,18 @@ class MiniMaxH3Pipeline:
             self._check_duration(num_frames)
 
         if height is None:
-            height, width = resolve_canvas_size(16, 9)
+            if motion_context is not None and motion_context.frames is not None:
+                # A continuation inherits the canvas of the clip it continues.
+                height, width = resolve_canvas_size(motion_context.frames.shape[2], motion_context.frames.shape[1])
+            else:
+                height, width = resolve_canvas_size(16, 9)
 
         prepared, num_frames = self._prepare_references(references, num_frames, min(height, width))
         num_latent_frames, latent_height, latent_width, num_audio_latents = self._latent_geometry(
             height, width, num_frames
         )
+        if motion_context is not None:
+            motion_context = resolve_motion_context(motion_context, height, width, num_frames, audio_motion_mode)
         return MiniMaxH3Plan(
             task="ref2va",
             height=height,
@@ -239,6 +262,7 @@ class MiniMaxH3Pipeline:
             latent_width=latent_width,
             num_audio_latents=num_audio_latents,
             prepared_references=prepared,
+            motion_context=motion_context,
         )
 
     def _prepare_references(
@@ -313,6 +337,73 @@ class MiniMaxH3Pipeline:
         return latents.to(torch.float16).float().cpu()
 
     @torch.no_grad()
+    def _encode_motion_context(self, plan, pixel_mean, pixel_std, latents_mean, latents_std):
+        """The previous clip's tail as conditioning rows: `(video_rows, audio_rows, latent_shape)`.
+
+        `latent_shape` is what the block's noise draw takes — one draw for the whole run, so that a motion context
+        costs the generator exactly one condition draw the way a keyframe or a reference does.
+        """
+        device = self.device
+        motion = plan.motion_context
+
+        pixels = torch.from_numpy(motion.frames.copy()).to(device).permute(3, 0, 1, 2)[None]
+        pixels = (pixels.to(torch.float32).div(255.0) - pixel_mean) / pixel_std
+        if motion.encode_mode == "frames" or motion.num_frames == 1:
+            # `_encode` pads up to a multiple of 17 and drops the trailing latents, so a run shorter than a chunk has
+            # to go through the clip encoder or it comes back covering frames that are not there.
+            moments = torch.cat(
+                [self.vae._encode_clip(pixels[:, :, index : index + 1]) for index in range(pixels.shape[2])], dim=2
+            )
+        else:
+            moments = self.vae._encode(pixels)
+        latents = self._sample_condition_latents(moments)
+
+        num_latent_frames = latents.shape[2]
+        if num_latent_frames != len(motion.frame_anchors):
+            raise RuntimeError(
+                f"The motion context encoded to {num_latent_frames} latent frames, but {len(motion.frame_anchors)} "
+                "were laid out. The video VAE grid no longer matches, refusing to render a shifted join."
+            )
+        if motion.encode_mode == "video" and latent_pixel_frame_count(num_latent_frames) != motion.num_frames:
+            raise RuntimeError(
+                f"The motion context's {num_latent_frames} latent frames cover "
+                f"{latent_pixel_frame_count(num_latent_frames)} pixel frames, not the {motion.num_frames} pinned. "
+                "The video VAE grid no longer matches, refusing to render a shifted join."
+            )
+        if (latents.shape[3], latents.shape[4]) != (plan.latent_height, plan.latent_width):
+            raise RuntimeError(
+                f"The motion context encoded to {latents.shape[3]}x{latents.shape[4]} latents, not the target's "
+                f"{plan.latent_height}x{plan.latent_width}. A motion context is the same clip, not a reference."
+            )
+        video_rows = patchify_video_latents((latents - latents_mean) / latents_std, self.patch_size)
+
+        audio_rows = None
+        if motion.num_audio_latents:
+            audio_latents_mean = torch.tensor(self.audio_vae.config.latents_mean).view(1, 1, -1)
+            audio_latents_std = torch.tensor(self.audio_vae.config.latents_std).view(1, 1, -1)
+            window = motion.num_audio_latents
+            if motion.audio_latents is not None:
+                # Sliced straight out of the previous segment's latents: a decode/encode round trip dulls the sound
+                # a little more at every link of a chain.
+                tail = motion.audio_latents[..., -window:].to(torch.float32).cpu().transpose(1, 2)
+            else:
+                waveform = prepare_reference_waveform(
+                    motion.waveform[..., -int(round(window / MINIMAX_H3_AUDIO_LATENTS_PER_SECOND * motion.sample_rate)) :],
+                    motion.sample_rate,
+                    self.audio_sampling_rate,
+                    max_duration=window / MINIMAX_H3_AUDIO_LATENTS_PER_SECOND,
+                )
+                posterior = self.audio_vae.encode(waveform.to(device)[:, None], return_dict=False)[0]
+                tail = posterior.mode().float().cpu()[:, :, -window:].transpose(1, 2)
+            if tail.shape[1] != window:
+                raise RuntimeError(
+                    f"The motion context's soundtrack window came back {tail.shape[1]} latents wide, not {window}."
+                )
+            audio_rows = ((tail - audio_latents_mean) / audio_latents_std).reshape(-1, self.audio_latent_channels)
+
+        return video_rows, audio_rows, (num_latent_frames, plan.latent_height, plan.latent_width)
+
+    @torch.no_grad()
     def encode_conditions(
         self, plan: MiniMaxH3Plan, generator: torch.Generator | None = None
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
@@ -323,19 +414,29 @@ class MiniMaxH3Pipeline:
         """
         device = self.device
         if plan.task in ("t2va", "fl2va"):
-            if not plan.keyframes:
+            if not plan.keyframes and plan.motion_context is None:
                 return None, None
             pixel_mean, pixel_std, latents_mean, latents_std = self._pixel_stats(device)
             rows = []
+            shapes = []
             for image in plan.keyframes:
                 pixels = torch.from_numpy(np.array(image)).to(device).permute(2, 0, 1)[None, :, None]
                 pixels = (pixels.to(torch.float32).div(255.0) - pixel_mean) / pixel_std
                 moments = self.vae._encode_clip(pixels)
                 latents = self._sample_condition_latents(moments)
                 rows.append(patchify_video_latents((latents - latents_mean) / latents_std, self.patch_size))
+                shapes.append((1, plan.latent_height, plan.latent_width))
+            audio_condition_latents = None
+            if plan.motion_context is not None:
+                # The motion context is packed last, after any keyframe, in both the layout and the latents.
+                motion_video, audio_condition_latents, motion_shape = self._encode_motion_context(
+                    plan, pixel_mean, pixel_std, latents_mean, latents_std
+                )
+                rows.append(motion_video)
+                shapes.append(motion_shape)
             condition_latents = torch.cat(rows)
             noise = keyframe_condition_noise(
-                ((1, plan.latent_height, plan.latent_width),) * len(plan.keyframes),
+                tuple(shapes),
                 self.patch_size,
                 self.vae_latent_channels,
                 generator=generator,
@@ -344,7 +445,9 @@ class MiniMaxH3Pipeline:
             condition_latents = self.scheduler.scale_noise(
                 condition_latents.to(device), MINIMAX_H3_KEYFRAME_NOISE_AUG, noise
             )
-            return condition_latents, None
+            if audio_condition_latents is not None:
+                audio_condition_latents = audio_condition_latents.to(device)
+            return condition_latents, audio_condition_latents
 
         # ref2va
         pixel_mean, pixel_std, latents_mean, latents_std = self._pixel_stats(device)
@@ -374,16 +477,27 @@ class MiniMaxH3Pipeline:
                 normalized = (latents - audio_latents_mean) / audio_latents_std
                 audio_rows.append(normalized.reshape(-1, self.audio_latent_channels))
 
+        shapes = [
+            (reference.num_latent_frames, reference.latent_height, reference.latent_width)
+            for reference in plan.prepared_references
+            if reference.kind != "audio"
+        ]
+        if plan.motion_context is not None:
+            # The motion context is packed last, after every reference, in both the layout and the latents.
+            motion_video, motion_audio, motion_shape = self._encode_motion_context(
+                plan, pixel_mean, pixel_std, latents_mean, latents_std
+            )
+            video_rows.append(motion_video)
+            shapes.append(motion_shape)
+            if motion_audio is not None:
+                audio_rows.append(motion_audio)
+
         condition_latents = torch.cat(video_rows) if video_rows else None
         audio_condition_latents = torch.cat(audio_rows) if audio_rows else None
 
         if condition_latents is not None:
             noise = keyframe_condition_noise(
-                tuple(
-                    (reference.num_latent_frames, reference.latent_height, reference.latent_width)
-                    for reference in plan.prepared_references
-                    if reference.kind != "audio"
-                ),
+                tuple(shapes),
                 self.patch_size,
                 self.vae_latent_channels,
                 generator=generator,
@@ -398,7 +512,17 @@ class MiniMaxH3Pipeline:
 
     # ------------------------------------------------------------------ layout / latents / timesteps
 
+    @staticmethod
+    def _motion_condition_blocks(plan: MiniMaxH3Plan) -> tuple[tuple, tuple]:
+        """The motion context's `(anchors, audio_windows)`, in the order `encode_conditions` packs its latents."""
+        motion = plan.motion_context
+        if motion is None:
+            return (), ()
+        windows = ((motion.num_audio_latents, motion.audio_start_offset),) if motion.num_audio_latents else ()
+        return motion.frame_anchors, windows
+
     def build_layout(self, plan: MiniMaxH3Plan, text_token_tags: torch.Tensor) -> MiniMaxH3PackedSequence:
+        anchors, audio_windows = self._motion_condition_blocks(plan)
         if plan.task == "ref2va":
             return build_ref2va_packed_sequence(
                 text_token_tags,
@@ -408,6 +532,8 @@ class MiniMaxH3Pipeline:
                 plan.latent_width,
                 plan.num_audio_latents,
                 self.patch_size,
+                anchors,
+                audio_windows,
             )
         return build_packed_sequence(
             text_token_tags,
@@ -416,7 +542,8 @@ class MiniMaxH3Pipeline:
             plan.latent_width,
             plan.num_audio_latents,
             self.patch_size,
-            plan.keyframe_anchors,
+            tuple(plan.keyframe_anchors) + anchors,
+            audio_windows,
         )
 
     @torch.no_grad()
@@ -428,6 +555,7 @@ class MiniMaxH3Pipeline:
         audio_latents: torch.Tensor | None = None,
         condition_latents: torch.Tensor | None = None,
         audio_condition_latents: torch.Tensor | None = None,
+        layout: MiniMaxH3PackedSequence | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Port of MiniMaxH3PrepareLatentsStep: video noise drawn first, then audio noise —
         strictly after the condition draws of `encode_conditions`."""
@@ -456,6 +584,18 @@ class MiniMaxH3Pipeline:
             video_rows = torch.cat([condition_latents.to(device), video_rows])
         if audio_condition_latents is not None:
             audio_rows = torch.cat([audio_condition_latents.to(device), audio_rows])
+        if layout is not None:
+            # The layout and the encoder both order conditioning blocks references-then-motion; a mismatch here is
+            # every way that ordering can come apart, and it would otherwise only show as a corrupt generation.
+            for name, rows, expected in (
+                ("video", condition_latents, layout.num_condition_video_rows),
+                ("audio", audio_condition_latents, layout.num_condition_audio_rows),
+            ):
+                found = 0 if rows is None else rows.shape[0]
+                if found != expected:
+                    raise RuntimeError(
+                        f"The layout expects {expected} {name} conditioning rows but the encoder produced {found}."
+                    )
         return video_rows, audio_rows
 
     @torch.no_grad()
