@@ -1,10 +1,19 @@
 # h3.py — standalone MiniMax-H3 GUI (MiniMax + Frame Interpolation + Video Info tabs)
 # Assembled from H1111/h1111.py (branch h3 @ ece03a2); backend lives in minimax_engine/.
+import os
+
+# Offline by default: no telemetry ping, no PyPI version check, no font fetch.
+# Must precede the gradio/huggingface imports — both read these at import time.
+os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
+os.environ.setdefault("DO_NOT_TRACK", "1")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("TIKTOKEN_CACHE_DIR", os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "weights", "tiktoken"))
+
 import gradio as gr
 import subprocess
 import threading
 import time
-import os
 import random
 import tiktoken
 import html
@@ -999,10 +1008,44 @@ def extract_video_metadata(video_path: str) -> Dict:
         print(f"Metadata extraction failed: {str(e)}")
         return {}
 
+_TOKEN_ENCODER = None
+_TOKEN_ENCODER_LOADED = False
+
+
+def _get_token_encoder():
+    """cl100k_base out of TIKTOKEN_CACHE_DIR, never off the network.
+
+    tiktoken fetches the BPE ranks over HTTP on a cache miss, and read_file is the
+    only path that does so — stubbing it keeps the lookup local. The ranks ship in
+    weights/tiktoken/; without them the counter degrades to an estimate.
+    """
+    global _TOKEN_ENCODER, _TOKEN_ENCODER_LOADED
+    if _TOKEN_ENCODER_LOADED:
+        return _TOKEN_ENCODER
+    _TOKEN_ENCODER_LOADED = True
+
+    from tiktoken import load as tiktoken_load
+
+    def _offline(*args, **kwargs):
+        raise OSError("cl100k_base BPE ranks are not cached locally")
+
+    original = tiktoken_load.read_file
+    tiktoken_load.read_file = _offline
+    try:
+        _TOKEN_ENCODER = tiktoken.get_encoding("cl100k_base")
+    except Exception:
+        logger.warning("cl100k_base not cached in %s — prompt token count is an estimate",
+                       os.environ["TIKTOKEN_CACHE_DIR"])
+    finally:
+        tiktoken_load.read_file = original
+    return _TOKEN_ENCODER
+
+
 def count_prompt_tokens(prompt: str) -> int:
-    enc = tiktoken.get_encoding("cl100k_base")
-    tokens = enc.encode(prompt)
-    return len(tokens)
+    enc = _get_token_encoder()
+    if enc is None:
+        return len(prompt) // 4
+    return len(enc.encode(prompt))
 
 
 def get_lora_options(lora_folder: str = "lora") -> List[str]:
@@ -1371,7 +1414,13 @@ def upscale_video(
 
 # UI setup
 with gr.Blocks(
+    analytics_enabled=False,
+    # System font stacks only — gradio's default sans is a GoogleFont, which makes
+    # the browser hit fonts.googleapis.com on every page load.
     theme=themes.Default(
+        font=("ui-sans-serif", "system-ui", "-apple-system", "Segoe UI",
+              "Roboto", "Helvetica Neue", "Arial", "sans-serif"),
+        font_mono=("ui-monospace", "Consolas", "Menlo", "monospace"),
         primary_hue=colors.Color(
             name="custom",
             c50="#E6F0FF",

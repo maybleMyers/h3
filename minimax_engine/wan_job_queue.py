@@ -593,6 +593,44 @@ class JobQueue:
                 self._save_jobs({})
                 return count
 
+    def clear_session(self, is_alive) -> Dict[str, int]:
+        """
+        Reset this instance's queue at startup, sparing anything still generating.
+
+        Pending jobs cannot survive a restart: their inputs are gradio uploads
+        under /tmp/gradio/<hash>/, which belong to the server that received
+        them, so running one afterwards fails on a missing path. Finished jobs
+        are last session's history and only clutter the GUI. A RUNNING job whose
+        process is still alive is a real generation that outlived its parent —
+        it keeps its slot so the worker yields the GPU to it and a browser can
+        still re-attach.
+
+        Only ever touches this instance's own queue file, so a second instance
+        on another port (or another host) is untouched.
+
+        Args:
+            is_alive: callable(pid) -> bool, used to test surviving processes
+
+        Returns:
+            {'removed': n, 'kept': n}
+        """
+        with self._thread_lock:
+            with self._file_lock():
+                jobs = self._load_jobs()
+                kept = {}
+
+                for job_id, data in jobs.items():
+                    if data.get('status') == JobStatus.RUNNING.value:
+                        pid = data.get('process_id')
+                        if pid and is_alive(pid):
+                            kept[job_id] = data
+
+                removed = len(jobs) - len(kept)
+                if removed:
+                    self._save_jobs(kept)
+
+                return {'removed': removed, 'kept': len(kept)}
+
 
 # Global queue instance for easy access
 _queue_instance = None

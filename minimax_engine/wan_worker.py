@@ -627,10 +627,15 @@ class Worker:
         print(f"[Wan Worker] Poll interval: {self.poll_interval}s")
         print("=" * 60)
 
-        # Reconcile whatever the previous session left behind. Wiping the queue
-        # here would destroy jobs still running under another instance sharing
-        # this file, and their monitors would read that as a cancellation.
-        self.recover_stale_jobs()
+        # Start this instance from a clean queue, but leave a generation that
+        # outlived the last server alone. Only this instance's queue file is
+        # touched; other instances keep their own.
+        try:
+            stats = self.queue.clear_session(self._process_alive)
+            print(f"[Worker] Queue reset: cleared {stats['removed']} job(s) from the "
+                  f"previous session, kept {stats['kept']} still generating")
+        except QueueUnavailable as e:
+            print(f"[Worker] Could not reset queue at startup: {e}")
 
         last_cleanup = time.time()
         cleanup_interval = 3600  # Clean up old jobs every hour
