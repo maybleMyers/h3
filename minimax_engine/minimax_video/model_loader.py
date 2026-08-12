@@ -20,6 +20,9 @@ logger = logging.getLogger(__name__)
 # fp8 targets the block stack only. AdaLN projections (`adaln_proj.linear`, ~40% of the
 # weights) are bfloat16 in the checkpoint and are *included* — required to fit 33B on a 48GB
 # card — unless `fp8_exclude_adaln` asks for the quality escape hatch (+~13 GB resident).
+# Curve-pruned checkpoints (minimax_engine/prune_adaln.py) sidestep the trade entirely: the
+# 13B of AdaLN collapses to ~155 MB, so the block stack can stay bfloat16 with no fp8 at all.
+# Their projections are float32 and 8 rows wide, and are always excluded from fp8 below.
 FP8_TARGET_KEYS = ["transformer_blocks."]
 FP8_EXCLUDE_KEYS = [
     "norm",
@@ -62,10 +65,12 @@ def _shard_files(component_dir):
     return files
 
 
-def _from_config(cls, config_path, torch_dtype):
+def _from_config(cls, config_path, torch_dtype, overrides=None):
     config = _read_json(config_path)
     config.pop("_class_name", None)
     config.pop("_diffusers_version", None)
+    if overrides:
+        config.update(overrides)
     with init_empty_weights():
         model = cls.from_config(config)
     if torch_dtype is not None:
@@ -82,8 +87,34 @@ def _load_sharded_state_dict(files, device, dtype=None):
     return sd
 
 
-def _is_fp32_key(key: str) -> bool:
-    return any(key.startswith(prefix) for prefix in FP32_KEY_PREFIXES)
+def _is_fp32_key(key: str, curve: bool = False) -> bool:
+    if any(key.startswith(prefix) for prefix in FP32_KEY_PREFIXES):
+        return True
+    # Curve-pruned checkpoints carry the time table and the AdaLN projections that consume it in
+    # float32 (they are 8 rows wide, so the precision is free), matching the transformer's
+    # `use_adaln_curves` branch, which interpolates and projects before casting to the stream dtype.
+    return curve and (
+        key == "adaln_t_table"
+        or ".adaln_proj.linear." in key
+        or key.startswith("norm_out.linear.")
+    )
+
+
+def _curve_overrides(files):
+    """Config overrides for a curve-pruned checkpoint, or None for a full one.
+
+    `adaln_t_table` replaces the timestep MLP; its `[grid, rank]` shape sets the AdaLN geometry,
+    which `config.json` (written for the full checkpoint) cannot know."""
+    from .int8_quant import read_safetensors_header
+
+    for path in files:
+        if not str(path).endswith(".safetensors"):
+            continue
+        entry = read_safetensors_header(path).get("adaln_t_table")
+        if entry is not None:
+            grid, rank = entry["shape"]
+            return {"adaln_curve_grid": grid, "time_embed_dim": rank}
+    return None
 
 
 # Musubi-tuner (h3 branch) LoRA keys: sd-scripts flat naming over the upstream fused module
@@ -264,9 +295,15 @@ def load_transformer(
         config_path = os.path.join(_component_dir(ckpt_dir, subfolder), "config.json")
         files = [tdir]
 
-    from .int8_quant import is_int8_checkpoint
+    from .int8_quant import is_int8_checkpoint, read_safetensors_header
 
-    if dit_path and not os.path.isdir(dit_path) and is_int8_checkpoint(dit_path):
+    # A single-file export already in this port's diffusers naming needs no key conversion and
+    # loads through the ordinary bf16/fp32 path below, curve-pruned or not; only upstream-named
+    # exports go to the int8 converter. `to_q` exists only in the split-QKV diffusers layout.
+    single_file = bool(dit_path) and not os.path.isdir(dit_path) and str(dit_path).endswith(".safetensors")
+    diffusers_layout = single_file and "transformer_blocks.0.attn.to_q.weight" in read_safetensors_header(dit_path)
+
+    if single_file and not diffusers_layout and is_int8_checkpoint(dit_path):
         if fp8 or fp8_scaled:
             logger.warning("int8 checkpoint detected: the weights are already quantized, fp8 flags are ignored")
         return _load_int8_transformer(
@@ -279,8 +316,12 @@ def load_transformer(
             int8_use_int_mm=int8_use_int_mm,
         )
 
-    exclude_keys = FP8_EXCLUDE_KEYS + (["adaln_proj"] if fp8_exclude_adaln else [])
-    model = _from_config(MiniMaxH3Transformer3DModel, config_path, dit_dtype)
+    curve_overrides = _curve_overrides(files)
+    curve = curve_overrides is not None
+    if curve and fp8_exclude_adaln:
+        logger.warning("curve-pruned checkpoint: fp8_exclude_adaln is redundant, AdaLN is never fp8 here")
+    exclude_keys = FP8_EXCLUDE_KEYS + (["adaln_proj"] if (fp8_exclude_adaln or curve) else [])
+    model = _from_config(MiniMaxH3Transformer3DModel, config_path, dit_dtype, overrides=curve_overrides)
 
     if lora_weights_list:
         expected_shapes = {k: tuple(v.shape) for k, v in model.state_dict().items()}
@@ -318,11 +359,11 @@ def load_transformer(
                 move_to_device=False,
             )
         for k in list(sd.keys()):
-            if _is_fp32_key(k) and sd[k].dtype != torch.float32:
+            if _is_fp32_key(k, curve) and sd[k].dtype != torch.float32:
                 sd[k] = sd[k].to(torch.float32)
         apply_fp8_monkey_patch(model, sd, use_scaled_mm=fp8_fast)
         info = model.load_state_dict(sd, strict=True, assign=True)
-        logger.info(f"fp8-scaled transformer load ({subfolder}): {info}")
+        logger.info(f"fp8-scaled transformer load ({subfolder}, curve_adaln={curve}): {info}")
     else:
         from utils.lora_utils import load_safetensors_with_lora_and_fp8
 
@@ -335,7 +376,7 @@ def load_transformer(
             move_to_device=False,
         )
         for k in list(sd.keys()):
-            if _is_fp32_key(k):
+            if _is_fp32_key(k, curve):
                 if sd[k].dtype != torch.float32:
                     sd[k] = sd[k].to(torch.float32)
             elif fp8 and (
@@ -349,7 +390,7 @@ def load_transformer(
             elif sd[k].dtype not in (torch.float8_e4m3fn,):
                 sd[k] = sd[k].to(dit_dtype)
         info = model.load_state_dict(sd, strict=True, assign=True)
-        logger.info(f"transformer load ({subfolder}): {info}")
+        logger.info(f"transformer load ({subfolder}, curve_adaln={curve}): {info}")
 
     model.eval().requires_grad_(False)
     return model
