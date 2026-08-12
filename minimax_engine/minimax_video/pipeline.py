@@ -173,16 +173,11 @@ class MiniMaxH3Pipeline:
         self._check_canvas(height, width)
 
         if task == "ref2va":
-            return self._setup_ref2va(height, width, num_frames, references, motion_context, audio_motion_mode)
+            return self._setup_ref2va(
+                height, width, num_frames, references, motion_context, audio_motion_mode, image, last_image
+            )
 
-        keyframes = [
-            ImageOps.exif_transpose(keyframe).convert("RGB")
-            for keyframe in (image, last_image)
-            if keyframe is not None
-        ]
-        keyframe_anchors = tuple(
-            anchor for anchor, keyframe in (("first", image), ("last", last_image)) if keyframe is not None
-        )
+        keyframes, keyframe_anchors = self._resolve_keyframes(image, last_image)
         if height is None:
             if keyframes:
                 height, width = resolve_canvas_size(*keyframes[0].size)
@@ -197,7 +192,9 @@ class MiniMaxH3Pipeline:
             height, width, num_frames
         )
         keyframes = [
-            prepare_keyframe_image(keyframe, height, width, stretch=index == 0)
+            # The first keyframe is the geometry anchor only when it is what the canvas came from: a continuation
+            # inherits the previous clip's canvas, so its keyframes follow it instead.
+            prepare_keyframe_image(keyframe, height, width, stretch=index == 0 and motion_context is None)
             for index, keyframe in enumerate(keyframes)
         ]
         if motion_context is not None:
@@ -216,8 +213,22 @@ class MiniMaxH3Pipeline:
             motion_context=motion_context,
         )
 
+    @staticmethod
+    def _resolve_keyframes(image, last_image) -> tuple[list, tuple]:
+        """The keyframe list and the anchors it is pinned at, in packed order."""
+        keyframes = [
+            ImageOps.exif_transpose(keyframe).convert("RGB")
+            for keyframe in (image, last_image)
+            if keyframe is not None
+        ]
+        anchors = tuple(
+            anchor for anchor, keyframe in (("first", image), ("last", last_image)) if keyframe is not None
+        )
+        return keyframes, anchors
+
     def _setup_ref2va(
-        self, height, width, num_frames, references, motion_context=None, audio_motion_mode="timeline"
+        self, height, width, num_frames, references, motion_context=None, audio_motion_mode="timeline",
+        image=None, last_image=None
     ) -> MiniMaxH3Plan:
         if not references:
             raise ValueError("`ref2va` needs at least one reference.")
@@ -250,6 +261,10 @@ class MiniMaxH3Pipeline:
         num_latent_frames, latent_height, latent_width, num_audio_latents = self._latent_geometry(
             height, width, num_frames
         )
+        # Unlike fl2va, a ref2va canvas never comes from a keyframe, so both keyframes follow it. They reach the model
+        # as conditioning rows only: the ref2va presentation enumerates references, not keyframes.
+        keyframes, keyframe_anchors = self._resolve_keyframes(image, last_image)
+        keyframes = [prepare_keyframe_image(keyframe, height, width, stretch=False) for keyframe in keyframes]
         if motion_context is not None:
             motion_context = resolve_motion_context(motion_context, height, width, num_frames, audio_motion_mode)
         return MiniMaxH3Plan(
@@ -261,6 +276,8 @@ class MiniMaxH3Pipeline:
             latent_height=latent_height,
             latent_width=latent_width,
             num_audio_latents=num_audio_latents,
+            keyframes=keyframes,
+            keyframe_anchors=keyframe_anchors,
             prepared_references=prepared,
             motion_context=motion_context,
         )
@@ -335,6 +352,17 @@ class MiniMaxH3Pipeline:
         # The sampled latent is rounded to float16 before it is normalized: ~11 bits of every
         # conditioning latent, so the released model's conditioning cannot be reproduced without it.
         return latents.to(torch.float16).float().cpu()
+
+    def _encode_keyframes(self, plan, pixel_mean, pixel_std, latents_mean, latents_std) -> tuple[list, list]:
+        """One single-frame condition block per keyframe, and their latent shapes, in packed order."""
+        rows, shapes = [], []
+        for image in plan.keyframes:
+            pixels = torch.from_numpy(np.array(image)).to(self.device).permute(2, 0, 1)[None, :, None]
+            pixels = (pixels.to(torch.float32).div(255.0) - pixel_mean) / pixel_std
+            latents = self._sample_condition_latents(self.vae._encode_clip(pixels))
+            rows.append(patchify_video_latents((latents - latents_mean) / latents_std, self.patch_size))
+            shapes.append((1, plan.latent_height, plan.latent_width))
+        return rows, shapes
 
     @torch.no_grad()
     def _encode_motion_context(self, plan, pixel_mean, pixel_std, latents_mean, latents_std):
@@ -417,15 +445,7 @@ class MiniMaxH3Pipeline:
             if not plan.keyframes and plan.motion_context is None:
                 return None, None
             pixel_mean, pixel_std, latents_mean, latents_std = self._pixel_stats(device)
-            rows = []
-            shapes = []
-            for image in plan.keyframes:
-                pixels = torch.from_numpy(np.array(image)).to(device).permute(2, 0, 1)[None, :, None]
-                pixels = (pixels.to(torch.float32).div(255.0) - pixel_mean) / pixel_std
-                moments = self.vae._encode_clip(pixels)
-                latents = self._sample_condition_latents(moments)
-                rows.append(patchify_video_latents((latents - latents_mean) / latents_std, self.patch_size))
-                shapes.append((1, plan.latent_height, plan.latent_width))
+            rows, shapes = self._encode_keyframes(plan, pixel_mean, pixel_std, latents_mean, latents_std)
             audio_condition_latents = None
             if plan.motion_context is not None:
                 # The motion context is packed last, after any keyframe, in both the layout and the latents.
@@ -482,8 +502,14 @@ class MiniMaxH3Pipeline:
             for reference in plan.prepared_references
             if reference.kind != "audio"
         ]
+        # Keyframes sit between the references and the motion context, in the layout and in the latents alike.
+        keyframe_rows, keyframe_shapes = self._encode_keyframes(
+            plan, pixel_mean, pixel_std, latents_mean, latents_std
+        )
+        video_rows += keyframe_rows
+        shapes += keyframe_shapes
         if plan.motion_context is not None:
-            # The motion context is packed last, after every reference, in both the layout and the latents.
+            # The motion context is packed last, after every reference and keyframe, in the layout and the latents.
             motion_video, motion_audio, motion_shape = self._encode_motion_context(
                 plan, pixel_mean, pixel_std, latents_mean, latents_std
             )
@@ -523,6 +549,12 @@ class MiniMaxH3Pipeline:
 
     def build_layout(self, plan: MiniMaxH3Plan, text_token_tags: torch.Tensor) -> MiniMaxH3PackedSequence:
         anchors, audio_windows = self._motion_condition_blocks(plan)
+        if "first" in plan.keyframe_anchors and 0.0 in anchors:
+            raise ValueError(
+                "A first keyframe and a motion context both anchor frame 0 of the target, so they would claim the "
+                "same rotary coordinate with different pictures. Drop the keyframe and let the context open the clip."
+            )
+        keyframe_anchors = tuple(plan.keyframe_anchors) + anchors
         if plan.task == "ref2va":
             return build_ref2va_packed_sequence(
                 text_token_tags,
@@ -532,7 +564,7 @@ class MiniMaxH3Pipeline:
                 plan.latent_width,
                 plan.num_audio_latents,
                 self.patch_size,
-                anchors,
+                keyframe_anchors,
                 audio_windows,
             )
         return build_packed_sequence(
@@ -542,7 +574,7 @@ class MiniMaxH3Pipeline:
             plan.latent_width,
             plan.num_audio_latents,
             self.patch_size,
-            tuple(plan.keyframe_anchors) + anchors,
+            keyframe_anchors,
             audio_windows,
         )
 

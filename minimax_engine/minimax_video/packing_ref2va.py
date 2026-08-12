@@ -444,8 +444,9 @@ def build_ref2va_packed_sequence(
         num_audio_latents (`int`): Number of target audio latents per channel.
         patch_size (`tuple[int, int, int]`): The transformer's `(t, h, w)` patch.
         keyframe_anchors (`tuple[str | float, ...]`):
-            One entry per motion-context video block, in packed order, anchored at that pixel frame of the *target*
-            timeline. Unlike a reference, these do not advance the rotary clock.
+            One entry per keyframe and per motion-context video block, in packed order, anchored at `"first"`,
+            `"last"` or that pixel frame of the *target* timeline. Unlike a reference, these do not advance the
+            rotary clock.
         audio_condition_windows (`tuple[tuple[int, float], ...]`):
             One `(num_latents, start_offset)` per motion-context audio block, `start_offset` being the rotary offset
             of the window's first latent from the target's own origin.
@@ -519,9 +520,9 @@ def build_ref2va_packed_sequence(
         else:
             raise ValueError(f"A reference must be an 'image', a 'video' or an 'audio', got {reference.kind!r}.")
 
-    # Motion-context blocks. They carry the previous clip's tail on the *target's* timeline rather than in a span of
-    # their own, which is what makes the model continue them instead of imitating them — so `rotary_time`, which is
-    # the target's origin by now, is where they are measured from and it does not move.
+    # Keyframe and motion-context blocks. They sit on the *target's* timeline rather than in a span of their own,
+    # which is what makes the model continue a context instead of imitating it — so `rotary_time`, which is the
+    # target's origin by now, is where they are measured from and it does not move.
     _validate_condition_anchors(keyframe_anchors, num_latent_frames)
     motion_video_rows = slice(cursor, cursor + num_motion_video_rows)
     for index, anchor in enumerate(keyframe_anchors):

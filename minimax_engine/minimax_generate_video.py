@@ -80,7 +80,8 @@ def parse_args() -> argparse.Namespace:
     # Request (no --negative_prompt / --guidance_scale: the checkpoint is guidance-distilled)
     parser.add_argument("--prompt", type=str, default=None, help="prompt text or path to a .txt file")
     parser.add_argument("--image_path", type=str, default=None, help="first keyframe (stretched onto the canvas)")
-    parser.add_argument("--last_image_path", type=str, default=None, help="last keyframe (cover-cropped)")
+    parser.add_argument("--last_image_path", type=str, default=None,
+                        help="last keyframe (cover-cropped); while chaining it pins the end of the final segment")
     parser.add_argument("--reference", type=str, action="append", default=None,
                         help="ref2va reference (repeatable, ordered; kind sniffed from the file). "
                              "Up to 9 images / 3 videos / 3 audio clips, 12 total.")
@@ -671,7 +672,7 @@ def run_one(args, task, device, seed, extra_references=None, motion_context=None
     # Setup (geometry + media preparation; no weights needed).
     prompt = read_text_or_path(args.prompt)
     height, width = resolve_canvas_args(args)
-    if height is None and args.aspect_ratio and task != "fl2va":
+    if height is None and args.aspect_ratio and not (args.image_path or args.last_image_path):
         from minimax_video.packing import resolve_canvas_size
 
         aspect_w, aspect_h = (float(x) for x in args.aspect_ratio.split(":"))
@@ -888,7 +889,10 @@ def run_chain(args, base_task, device):
     Under --chain_mode motion each segment after the first pins the previous segment's tail as conditioning rows on
     its own timeline, regenerates those frames and has them trimmed back off, so the join is a continuation rather
     than a cut. The older reference modes carry the previous segment as a reference instead. With --chain_extend an
-    existing video seeds the chain the same way and is prepended to the joined output."""
+    existing video seeds the chain the same way and is prepended to the joined output.
+
+    --last_image_path rides the final segment and pins the end of the chain; --image_path only survives a segment
+    that starts cold, because a motion context already anchors frame 0."""
     from minimax_video.motion_context import (
         MiniMaxH3MotionContext,
         chain_frame_budget,
@@ -974,15 +978,17 @@ def run_chain(args, base_task, device):
     for i in range(args.chain_count):
         print(f"=== Generating clip {i + 1}/{args.chain_count} ===", flush=True)
         task = "ref2va" if extra_ref is not None else base_task
-        if motion_mode and any(keyframe_paths):
-            # A keyframe anchors the frame the motion context already pins, so the two would claim the same rotary
-            # coordinate with different pictures. Keyframes belong to the segment that starts the chain.
-            starts_cold = i == 0 and not args.chain_extend
-            args.image_path, args.last_image_path = keyframe_paths if starts_cold else (None, None)
-            if i == 0 and not starts_cold:
-                logger.info("keyframes dropped: --chain_extend makes the motion context the anchor of every clip")
-            elif i == 1:
-                logger.info("keyframes dropped from clip 2 on: the motion context anchors continuing clips")
+        if any(keyframe_paths):
+            # The first frame anchors frame 0, which a motion context already pins with the previous clip's picture,
+            # so it only survives a cold start. The last frame anchors the final frame, which no context run reaches,
+            # so it rides the clip that closes the chain.
+            args.image_path = keyframe_paths[0] if i == 0 and not (motion_mode and args.chain_extend) else None
+            args.last_image_path = keyframe_paths[1] if i == args.chain_count - 1 else None
+            if i == 0:
+                if keyframe_paths[0] and not args.image_path:
+                    logger.info("first frame dropped: the motion context anchors the start of an extended clip")
+                if keyframe_paths[1] and args.chain_count > 1:
+                    logger.info(f"last frame held for clip {args.chain_count}: it pins the end of the chain")
         plan, video_latents, audio_latents, frames, waveform, sample_rate, stopped_early = run_one(
             args, task, device, base_seed + i,
             extra_references=[extra_ref] if extra_ref is not None else None,
@@ -999,6 +1005,8 @@ def run_chain(args, base_task, device):
                            frames, waveform, sample_rate, base, i)
         del video_latents
         if stopped_early:
+            if keyframe_paths[1] and i < args.chain_count - 1:
+                logger.warning("stopped before the final clip: the last frame never got pinned")
             logger.info(f"stop requested in clip {i + 1}: joining the segments generated so far")
             break
         if i + 1 < args.chain_count:

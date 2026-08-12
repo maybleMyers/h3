@@ -487,6 +487,12 @@ def minimax_submit_to_queue(
 
     references = minimax_order_references(reference_files, reference_order)
 
+    chain_extend = str(chain_extend_video).strip() if chain_extend_video else ""
+    chaining = bool(chain_enable) and (int(chain_count) >= 2 or bool(chain_extend))
+    # Motion context anchors the start of an extension, so a First Frame cannot be used there.
+    if chaining and chain_mode == "motion" and chain_extend and input_image:
+        input_image = None
+
     if task_override and task_override != "auto":
         task_name = task_override
     elif references:
@@ -496,8 +502,6 @@ def minimax_submit_to_queue(
     else:
         task_name = "t2va"
 
-    chain_extend = str(chain_extend_video).strip() if chain_extend_video else ""
-    chaining = bool(chain_enable) and (int(chain_count) >= 2 or bool(chain_extend))
     if bool(chain_enable) and not chaining:
         raise gr.Error("Chaining with 1 segment needs an Extend video")
     if chaining and chain_extend and not os.path.exists(chain_extend):
@@ -578,6 +582,13 @@ def minimax_submit_to_queue(
         width = height = None
 
     if prompt_template:
+        # Chaining puts the First Frame on segment 1 and the Last Frame on the last one, and each segment sees a
+        # single <Picture 1>, so one alignment sentence cannot describe both.
+        if chaining and input_image and last_image:
+            raise gr.Error(
+                "Chaining pins the First Frame on the first segment and the Last Frame on the last one, so the "
+                "Prompt Template cannot align both. Clear one keyframe, or write the prompt yourself."
+            )
         prompt = minimax_assemble_template_prompt(
             task_name, tpl_imd, tpl_subjects, tpl_summary, tpl_retention, tpl_detailed,
             tpl_soundscape, tpl_music, bool(input_image), bool(last_image), video_length,
@@ -1491,7 +1502,8 @@ with gr.Blocks(
                             type="filepath",
                         )
                         minimax_last_image = gr.Image(
-                            label="Last Frame (cover-cropped; can be used on its own)",
+                            label="Last Frame (cover-cropped; can be used on its own; while chaining it pins "
+                                  "the end of the last segment)",
                             type="filepath",
                         )
 
@@ -1606,6 +1618,11 @@ with gr.Blocks(
                                     value="timeline", label="Audio Context",
                                 )
                             minimax_chain_budget = gr.Markdown("")
+                            gr.Markdown(
+                                "*Keyframes: the Last Frame rides the final segment and pins the end of the "
+                                "chain. The First Frame is ignored when extending — the context already anchors "
+                                "the start — and otherwise opens segment 1 only.*"
+                            )
                         minimax_chain_keep_segments = gr.Checkbox(
                             label="Keep per-segment files", value=False,
                             info="also write each segment as its own mp4 next to the joined video",
@@ -2149,7 +2166,10 @@ with gr.Blocks(
 
     # Keyframe upload snaps the canvas to the image (first frame wins — it anchors the
     # geometry; the last frame is cover-cropped). Cleared images blank the fields back to auto.
-    def update_minimax_dimensions(input_image, last_image):
+    def update_minimax_dimensions(input_image, last_image, chain_enable, chain_extend_video):
+        # An extension takes its canvas from the source video, so a keyframe must not snap the fields there.
+        if chain_enable and chain_extend_video:
+            return "", gr.update(value=None), gr.update(value=None)
         image = input_image or last_image
         if image is None:
             return "", gr.update(value=None), gr.update(value=None)
@@ -2159,16 +2179,16 @@ with gr.Blocks(
         h = max(32, (h // 32) * 32)
         return f"{w}x{h}", w, h
 
-    minimax_input_image.change(
-        fn=update_minimax_dimensions,
-        inputs=[minimax_input_image, minimax_last_image],
-        outputs=[minimax_original_dims, minimax_width, minimax_height],
-    )
-    minimax_last_image.change(
-        fn=update_minimax_dimensions,
-        inputs=[minimax_input_image, minimax_last_image],
-        outputs=[minimax_original_dims, minimax_width, minimax_height],
-    )
+    minimax_canvas_inputs = [
+        minimax_input_image, minimax_last_image, minimax_chain_enable, minimax_chain_extend_video
+    ]
+    for trigger in (minimax_input_image.change, minimax_last_image.change,
+                    minimax_chain_enable.change, minimax_chain_extend_video.change):
+        trigger(
+            fn=update_minimax_dimensions,
+            inputs=minimax_canvas_inputs,
+            outputs=[minimax_original_dims, minimax_width, minimax_height],
+        )
 
     def minimax_calc_width(height, original_dims):
         if not original_dims or not height:
