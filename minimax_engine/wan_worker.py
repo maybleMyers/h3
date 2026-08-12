@@ -30,7 +30,7 @@ from typing import Optional, Tuple
 from datetime import datetime
 import imageio_ffmpeg
 
-from wan_job_queue import get_queue, JobQueue, JobStatus, Job
+from wan_job_queue import get_queue, JobQueue, JobStatus, Job, QueueUnavailable
 
 
 def get_ffmpeg_path():
@@ -241,10 +241,28 @@ class Worker:
 
         return None, None, 0, 0
 
-    def check_cancellation(self, job_id: str) -> bool:
-        """Check if the job has been cancelled."""
-        job = self.queue.get_job(job_id)
-        return job is None or job.status == JobStatus.CANCELLED.value
+    # A vanished job only counts as a cancellation after this many consecutive
+    # misses (~1 min at the 2 s poll). Below that it is treated as a transient
+    # queue problem — killing an hour-long generation over one bad read is far
+    # worse than letting a genuinely-deleted job run to completion.
+    MISSING_JOB_TOLERANCE = 30
+
+    def check_cancellation(self, job_id: str) -> Optional[bool]:
+        """Whether the job has been cancelled.
+
+        Returns True (cancelled), False (still live), or None when the queue
+        could not be read or the job is absent — never conflate those with a
+        cancellation.
+        """
+        try:
+            job = self.queue.get_job(job_id)
+        except QueueUnavailable as e:
+            print(f"[Worker] Queue unreadable while checking job {job_id}: {e}")
+            return None
+
+        if job is None:
+            return None
+        return job.status == JobStatus.CANCELLED.value
 
     def _cancellation_monitor(self, job_id: str):
         """
@@ -255,23 +273,40 @@ class Worker:
         cancellation every 2 seconds so stops are near-instant instead of
         waiting for the next step output.
         """
+        missing = 0
         while not self._cancellation_stop_event.is_set():
-            if self.check_cancellation(job_id):
+            cancelled = self.check_cancellation(job_id)
+
+            if cancelled is None:
+                missing += 1
+                if missing == 1 or missing % 10 == 0:
+                    print(f"[Worker] Job {job_id} not readable from queue "
+                          f"({missing}/{self.MISSING_JOB_TOLERANCE}) - not cancelling")
+                if missing < self.MISSING_JOB_TOLERANCE:
+                    self._cancellation_stop_event.wait(2.0)
+                    continue
+                print(f"[Worker] Job {job_id} missing from queue for "
+                      f"{missing} consecutive checks, treating as cancelled")
+            elif cancelled:
+                missing = 0
                 print(f"[Worker] Job {job_id} cancellation detected, terminating immediately...")
-                self._was_cancelled = True
-                if self.current_process:
+            else:
+                missing = 0
+                self._cancellation_stop_event.wait(2.0)
+                continue
+
+            self._was_cancelled = True
+            if self.current_process:
+                try:
+                    self.current_process.terminate()
                     try:
-                        self.current_process.terminate()
-                        try:
-                            self.current_process.wait(timeout=2)
-                        except subprocess.TimeoutExpired:
-                            print(f"[Worker] Process didn't terminate, killing...")
-                            self.current_process.kill()
-                    except Exception as e:
-                        print(f"[Worker] Error terminating process: {e}")
-                return
-            # Check every 2 seconds for cancellation
-            self._cancellation_stop_event.wait(2.0)
+                        self.current_process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        print(f"[Worker] Process didn't terminate, killing...")
+                        self.current_process.kill()
+                except Exception as e:
+                    print(f"[Worker] Error terminating process: {e}")
+            return
 
     def run_job(self, job: Job) -> bool:
         """
@@ -301,6 +336,8 @@ class Worker:
             save_path = job.parameters.get('save_path', 'outputs')
             preview_path = os.path.join(save_path, "previews", f"latent_preview_{preview_suffix}.mp4")
 
+        job_log = self._open_job_log(job)
+
         try:
             # Start the subprocess
             self.current_process = subprocess.Popen(
@@ -312,8 +349,8 @@ class Worker:
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
             )
 
-            # Mark job as running
-            self.queue.mark_running(job.id, self.current_process.pid)
+            # The job was already set RUNNING when it was claimed; just record the pid.
+            self.queue.attach_process(job.id, self.current_process.pid)
 
             # Start cancellation monitor thread for immediate stop response
             monitor_thread = threading.Thread(
@@ -325,6 +362,8 @@ class Worker:
 
             last_preview_mtime = 0
             output_lines = []
+            last_write_time = 0.0
+            last_write_progress = -100.0
 
             # Monitor the process
             while True:
@@ -337,6 +376,7 @@ class Worker:
                 if line:
                     line = line.strip()
                     output_lines.append(line)
+                    self._write_job_log(job_log, line)
                     if self._should_print_line(line):
                         print(f"[Job {job.id}] {line}")
 
@@ -354,14 +394,30 @@ class Worker:
                             except:
                                 pass
 
-                        self.queue.update_progress(
-                            job.id,
-                            progress=progress,
-                            progress_text=progress_text,
-                            current_step=current_step,
-                            total_steps=total_steps,
-                            preview_path=current_preview
+                        # Each write is a whole-file rewrite under the lock, and
+                        # tqdm emits many lines a second. Throttling keeps an
+                        # hour-long run from starving every other reader.
+                        now = time.time()
+                        should_write = (
+                            current_preview
+                            or abs(progress - last_write_progress) >= 1.0
+                            or now - last_write_time >= 1.0
                         )
+                        if should_write:
+                            try:
+                                self.queue.update_progress(
+                                    job.id,
+                                    progress=progress,
+                                    progress_text=progress_text,
+                                    current_step=current_step,
+                                    total_steps=total_steps,
+                                    preview_path=current_preview
+                                )
+                                last_write_time = now
+                                last_write_progress = progress
+                            except QueueUnavailable as e:
+                                # A dropped progress tick is cosmetic; the run continues.
+                                print(f"[Worker] Could not write progress for {job.id}: {e}")
                 else:
                     # No output, sleep briefly
                     time.sleep(0.1)
@@ -383,6 +439,7 @@ class Worker:
             if remaining:
                 for line in remaining.strip().split('\n'):
                     output_lines.append(line)
+                    self._write_job_log(job_log, line)
                     if self._should_print_line(line):
                         print(f"[Job {job.id}] {line}")
 
@@ -399,7 +456,7 @@ class Worker:
                 except Exception as meta_err:
                     print(f"[Worker] Warning: Failed to add metadata: {meta_err}")
 
-                self.queue.mark_completed(job.id, return_code)
+                self._finalize(self.queue.mark_completed, job.id, return_code)
                 print(f"[Worker] Job {job.id} completed successfully")
                 return True
             else:
@@ -413,7 +470,7 @@ class Worker:
                         error_msg = line
                         break
 
-                self.queue.mark_failed(job.id, error_msg, return_code)
+                self._finalize(self.queue.mark_failed, job.id, error_msg, return_code)
                 print(f"[Worker] Job {job.id} failed: {error_msg}")
                 return False
 
@@ -424,36 +481,143 @@ class Worker:
                 monitor_thread.join(timeout=1.0)
             self.current_process = None
             self.current_job_id = None
-            self.queue.mark_failed(job.id, str(e))
+            self._finalize(self.queue.mark_failed, job.id, str(e))
             print(f"[Worker] Job {job.id} exception: {e}")
+            return False
+
+        finally:
+            if job_log:
+                try:
+                    job_log.close()
+                except Exception:
+                    pass
+
+    LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "outputs", "logs")
+
+    def _open_job_log(self, job: Job):
+        """Open this job's own log file.
+
+        Console output scrolls away and is interleaved across instances; an
+        hour-long run that fails at minute 55 needs its own transcript.
+        """
+        try:
+            os.makedirs(self.LOG_DIR, exist_ok=True)
+            handle = open(os.path.join(self.LOG_DIR, f"job_{job.id}.log"),
+                          "w", encoding="utf-8")
+            handle.write(f"# job {job.id} batch {job.batch_id} "
+                         f"started {datetime.now().isoformat()}\n")
+            handle.write(f"# command: {' '.join(job.command)}\n\n")
+            handle.flush()
+            return handle
+        except OSError as e:
+            print(f"[Worker] Could not open job log for {job.id}: {e}")
+            return None
+
+    @staticmethod
+    def _write_job_log(handle, line: str) -> None:
+        if handle is None:
+            return
+        try:
+            handle.write(line + "\n")
+            handle.flush()
+        except OSError:
+            pass
+
+    @staticmethod
+    def _finalize(mark, job_id: str, *args) -> None:
+        """Write a job's terminal status, retrying past transient queue trouble.
+
+        A lost terminal write is what strands the GUI on "Processing" forever,
+        so it is worth several attempts. Recording the wrong terminal status is
+        worse than none, so a failure here is left for recover_stale_jobs.
+        """
+        for attempt in range(5):
+            try:
+                mark(job_id, *args)
+                return
+            except QueueUnavailable as e:
+                print(f"[Worker] Terminal write for {job_id} failed "
+                      f"(attempt {attempt + 1}/5): {e}")
+                time.sleep(0.5 * (attempt + 1))
+        print(f"[Worker] Gave up writing terminal status for {job_id}")
+
+    # A job may sit RUNNING with no pid for this long between being claimed and
+    # its subprocess starting. Recovering inside that window would fail a job
+    # that is about to run perfectly well.
+    CLAIM_GRACE_SECONDS = 60.0
+
+    @staticmethod
+    def _process_alive(pid: int) -> bool:
+        try:
+            if os.name == 'nt':
+                import ctypes
+                kernel32 = ctypes.windll.kernel32
+                handle = kernel32.OpenProcess(0x1000, False, pid)
+                if handle:
+                    kernel32.CloseHandle(handle)
+                    return True
+                return False
+            os.kill(pid, 0)
+            return True
+        except (OSError, ProcessLookupError):
             return False
 
     def recover_stale_jobs(self):
         """
-        Recover jobs that were marked as running but whose process is no longer alive.
-        This handles cases where the worker crashed without properly marking jobs as failed.
-        """
-        running_jobs = self.queue.get_running_jobs()
-        for job in running_jobs:
-            if job.process_id:
-                # Check if process is still running
-                try:
-                    if os.name == 'nt':  # Windows
-                        import ctypes
-                        kernel32 = ctypes.windll.kernel32
-                        handle = kernel32.OpenProcess(0x1000, False, job.process_id)
-                        if handle:
-                            kernel32.CloseHandle(handle)
-                            continue  # Process still running
-                    else:  # Unix
-                        os.kill(job.process_id, 0)
-                        continue  # Process still running
-                except (OSError, ProcessLookupError):
-                    pass
+        Recover jobs marked RUNNING whose process is no longer alive.
 
-            # Process is not running - mark as failed
-            print(f"[Worker] Recovering stale job {job.id} (process {job.process_id} not found)")
-            self.queue.mark_failed(job.id, "Worker process died unexpectedly")
+        Covers a worker or subprocess that died without marking the job failed,
+        which would otherwise leave the GUI polling "Processing" forever. Only a
+        confirmed-dead pid recovers a job — a live but silent process may just be
+        loading checkpoint shards, and failing it would be worse than waiting.
+        """
+        try:
+            running_jobs = self.queue.get_running_jobs()
+        except QueueUnavailable as e:
+            print(f"[Worker] Skipping stale-job recovery, queue unreadable: {e}")
+            return
+
+        now = time.time()
+        for job in running_jobs:
+            if job.id == self.current_job_id:
+                continue  # Ours, and we are watching it directly.
+
+            if job.process_id:
+                if self._process_alive(job.process_id):
+                    continue
+                reason = f"process {job.process_id} is gone"
+            else:
+                # Claimed but never attached a pid.
+                age = now - (job.started_at or job.created_at)
+                if age < self.CLAIM_GRACE_SECONDS:
+                    continue
+                reason = f"no process started after {age:.0f}s"
+
+            print(f"[Worker] Recovering stale job {job.id} ({reason})")
+            try:
+                self.queue.mark_failed(job.id, f"Job did not survive: {reason}")
+            except QueueUnavailable as e:
+                print(f"[Worker] Could not mark {job.id} failed: {e}")
+
+    def _foreign_running_job(self) -> Optional[Job]:
+        """A live RUNNING job this worker did not start, if any.
+
+        Killing the h3 server leaves its generation subprocess alive — it still
+        finishes and writes its output — so a restarted worker has to yield the
+        GPU to it rather than launching alongside it.
+        """
+        try:
+            running = self.queue.get_running_jobs()
+        except QueueUnavailable:
+            return None
+
+        for job in running:
+            if job.id == self.current_job_id or not job.process_id:
+                continue
+            if self._process_alive(job.process_id):
+                return job
+        return None
 
     def run(self):
         """Main worker loop."""
@@ -463,28 +627,42 @@ class Worker:
         print(f"[Wan Worker] Poll interval: {self.poll_interval}s")
         print("=" * 60)
 
-        # Clear all jobs from previous session on startup
-        cleared = self.queue.clear_all()
-        if cleared > 0:
-            print(f"[Worker] Cleared {cleared} stale job(s) from previous session")
+        # Reconcile whatever the previous session left behind. Wiping the queue
+        # here would destroy jobs still running under another instance sharing
+        # this file, and their monitors would read that as a cancellation.
+        self.recover_stale_jobs()
 
         last_cleanup = time.time()
         cleanup_interval = 3600  # Clean up old jobs every hour
+        last_recovery = time.time()
+        recovery_interval = 60  # Re-check for orphaned running jobs every minute
+        last_orphan_notice = 0.0
 
         while self.running:
             try:
-                # Get next pending job
-                job = self.queue.get_next_pending()
+                # A generation orphaned by a previous instance keeps running and
+                # keeps its VRAM. Starting a second job on top of it would OOM
+                # both, so wait for it instead.
+                orphan = self._foreign_running_job()
+                if orphan:
+                    if time.time() - last_orphan_notice > 60:
+                        print(f"[Worker] Waiting on job {orphan.id} from an earlier "
+                              f"instance (pid {orphan.process_id})")
+                        last_orphan_notice = time.time()
+                    time.sleep(self.poll_interval)
+                    continue
+
+                # Take the next pending job (claim marks it RUNNING atomically)
+                job = self.queue.claim_next_pending()
 
                 if job:
                     self.run_job(job)
                 else:
-                    # No jobs - display queue stats periodically
-                    stats = self.queue.get_queue_stats()
-                    if stats['pending'] == 0 and stats['running'] == 0:
-                        # Only print idle message occasionally
-                        pass
                     time.sleep(self.poll_interval)
+
+                    if time.time() - last_recovery > recovery_interval:
+                        self.recover_stale_jobs()
+                        last_recovery = time.time()
 
                 # Periodic cleanup of old jobs
                 if time.time() - last_cleanup > cleanup_interval:
@@ -495,6 +673,9 @@ class Worker:
 
             except KeyboardInterrupt:
                 break
+            except QueueUnavailable as e:
+                print(f"[Worker] Queue unavailable, retrying: {e}")
+                time.sleep(self.poll_interval)
             except Exception as e:
                 print(f"[Worker] Error in main loop: {e}")
                 time.sleep(self.poll_interval)

@@ -27,9 +27,37 @@ if ENGINE_DIR not in sys.path:
     sys.path.insert(0, ENGINE_DIR)
 
 logger = logging.getLogger(__name__)
+LOG_DIR = os.path.join(BASE_DIR, "outputs", "logs")
+
+
+def setup_logging(port: int) -> None:
+    """Tee the root logger to a per-instance rotating file.
+
+    Runs are hours long across several instances, and until now everything went
+    to stdout only — there was no way to reconstruct an incident afterwards.
+    """
+    from logging.handlers import RotatingFileHandler
+
+    os.makedirs(LOG_DIR, exist_ok=True)
+    handler = RotatingFileHandler(
+        os.path.join(LOG_DIR, f"h3_{port}.log"),
+        maxBytes=16 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-7s [%(name)s] %(message)s"
+    ))
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.addHandler(handler)
+    root.addHandler(logging.StreamHandler(sys.stdout))
 
 # Job queue system for background generation (survives browser disconnects)
-from wan_job_queue import get_queue, JobQueue, JobStatus, Job
+from wan_job_queue import (
+    get_queue, set_queue_port, FileLock, JobQueue, JobStatus, Job, QueueUnavailable,
+)
 from wan_worker import Worker
 
 # Global tracking for the queue-based generation
@@ -55,29 +83,11 @@ def format_elapsed_time(seconds: float) -> str:
     return f"{h}h {m:02d}m"
 
 
-def wan22_poll_active_job(current_job_id: str, current_batch_id: str):
-    """Poll the queue for job status updates.
+def _render_batch(jobs: List[Job]):
+    """Build the gallery/status view for one batch.
 
-    Called by Timer to get live updates. Returns updated state.
+    Returns (videos, preview_path, status_text, progress_text, still_active).
     """
-    queue = get_queue()
-
-    # Get all jobs in batch
-    jobs = []
-    if current_batch_id:
-        jobs = queue.get_batch_jobs(current_batch_id)
-    elif current_job_id:
-        job = queue.get_job(current_job_id)
-        if job:
-            jobs = [job]
-
-    # If no jobs found, try to find running job
-    if not jobs:
-        running_jobs = queue.get_running_jobs()
-        if running_jobs:
-            jobs = running_jobs
-            current_batch_id = jobs[0].batch_id or ""
-
     all_videos = []
     running_job = None
     status_parts = []
@@ -119,7 +129,6 @@ def wan22_poll_active_job(current_job_id: str, current_batch_id: str):
             done_msg += f" (total {format_elapsed_time(total_elapsed)})"
         status_parts.insert(0, done_msg)
         progress_text = "Done"
-        timer_active = False
     elif completed_count + failed_count == total_jobs and total_jobs > 0:
         total_elapsed = sum(j.elapsed_time for j in jobs if j.status == JobStatus.COMPLETED.value)
         done_msg = f"Batch complete: {completed_count} succeeded, {failed_count} failed"
@@ -127,11 +136,8 @@ def wan22_poll_active_job(current_job_id: str, current_batch_id: str):
             done_msg += f" (total {format_elapsed_time(total_elapsed)})"
         status_parts.insert(0, done_msg)
         progress_text = "Done"
-        timer_active = False
     elif total_jobs == 0:
-        status_parts.append("No jobs found - may still be initializing")
-        timer_active = True
-        progress_text = "Waiting..."
+        status_parts.append("No jobs found for this batch")
     else:
         # Still pending
         pending = total_jobs - completed_count - failed_count
@@ -140,46 +146,151 @@ def wan22_poll_active_job(current_job_id: str, current_batch_id: str):
         progress_text = "Waiting for worker..."
 
     status_text = " | ".join(status_parts) if status_parts else "Processing..."
+    return all_videos, preview_path, status_text, progress_text, timer_active
 
-    # Return: (videos, preview_list, status, progress, job_id, batch_id, timer)
+
+def wan22_poll_active_job(current_job_id: str, current_batch_id: str):
+    """Poll the queue for status of the batch this browser window submitted.
+
+    A window only ever tracks its own batch. Falling back to whatever job
+    happened to be running would make a second window display — and its Stop
+    button cancel — the first window's generation.
+    """
+    idle = (
+        gr.update(), gr.update(), gr.update(), gr.update(),
+        current_job_id, current_batch_id,
+        gr.Timer(value=2.0, active=False), gr.update(),
+    )
+
+    if not current_batch_id and not current_job_id:
+        return idle
+
+    try:
+        queue = get_queue()
+        if current_batch_id:
+            jobs = queue.get_batch_jobs(current_batch_id)
+        else:
+            job = queue.get_job(current_job_id)
+            jobs = [job] if job else []
+    except QueueUnavailable as e:
+        # Hold the last-known view and keep polling — a transient read failure
+        # must never look like "your generation disappeared".
+        logger.warning("Queue read failed during poll: %s", e)
+        return (
+            gr.update(), gr.update(), gr.update(), "Queue busy, retrying...",
+            current_job_id, current_batch_id,
+            gr.Timer(value=2.0, active=True), gr.update(),
+        )
+
+    all_videos, preview_path, status_text, progress_text, timer_active = _render_batch(jobs)
+
     return (
-        all_videos,
+        all_videos if all_videos or jobs else gr.update(),
         [preview_path] if preview_path else [],
         status_text,
         progress_text,
         current_job_id,
         current_batch_id,
-        gr.Timer(value=2.0, active=timer_active)
+        gr.Timer(value=2.0, active=timer_active),
+        # Forget a finished batch so a later reload does not re-attach to it.
+        current_batch_id if timer_active else "",
+    )
+
+
+def minimax_reattach(stored_batch_id: str):
+    """Re-bind this window to the batch it submitted, after a reload or dropout.
+
+    gr.State is keyed on the gradio session, which a page reload discards — so
+    without this the server keeps generating for another 50 minutes into a GUI
+    that shows nothing. The batch id comes back from the browser's localStorage.
+    """
+    stored = (stored_batch_id or "").strip()
+    if not stored:
+        return (
+            gr.update(), gr.update(), gr.update(), gr.update(),
+            "", "", gr.Timer(value=2.0, active=False), "",
+        )
+
+    try:
+        jobs = get_queue().get_batch_jobs(stored)
+    except QueueUnavailable as e:
+        # Keep the binding and let the timer retry rather than dropping it.
+        logger.warning("Queue unreadable during reattach: %s", e)
+        return (
+            gr.update(), gr.update(), "Reconnecting...", "",
+            "", stored, gr.Timer(value=2.0, active=True), stored,
+        )
+
+    if not jobs:
+        logger.info("Stored batch %s is unknown; detaching", stored)
+        return (
+            gr.update(), gr.update(), gr.update(), gr.update(),
+            "", "", gr.Timer(value=2.0, active=False), "",
+        )
+
+    all_videos, preview_path, status_text, progress_text, timer_active = _render_batch(jobs)
+    logger.info("Reattached to batch %s (%d job(s), active=%s)",
+                stored, len(jobs), timer_active)
+
+    return (
+        all_videos,
+        [preview_path] if preview_path else [],
+        status_text,
+        progress_text,
+        jobs[0].id,
+        stored,
+        gr.Timer(value=2.0, active=timer_active),
+        stored if timer_active else "",
     )
 
 
 def wan22_stop_queue_generation(current_batch_id: str):
-    """Cancel all jobs in the current batch and stop processing."""
-    global wan22_current_output_filename
+    """Cancel all jobs in this window's batch and stop processing."""
+    if not current_batch_id:
+        return (
+            gr.update(), gr.update(),
+            "No attached generation to stop", "",
+            "", "", gr.Timer(value=2.0, active=False), "",
+        )
 
-    queue = get_queue()
+    try:
+        cancelled_jobs = get_queue().cancel_batch(current_batch_id)
+    except QueueUnavailable as e:
+        logger.error("Could not cancel batch %s: %s", current_batch_id, e)
+        return (
+            gr.update(), gr.update(),
+            f"Could not reach the queue to cancel: {e}", "",
+            "", current_batch_id, gr.Timer(value=2.0, active=True), current_batch_id,
+        )
 
-    if current_batch_id:
-        cancelled_jobs = queue.cancel_batch(current_batch_id)
-        print(f"[Queue] Cancelled {len(cancelled_jobs)} jobs in batch {current_batch_id}")
-
-    # Return reset state
+    logger.info("Cancelled %d job(s) in batch %s", len(cancelled_jobs), current_batch_id)
     return (
         gr.update(),  # videos - keep existing gallery
         [],  # preview
-        "Generation cancelled",  # status
+        f"Cancelled {len(cancelled_jobs)} job(s)",  # status
         "Stopped",  # progress
         "",  # job_id
         "",  # batch_id
-        gr.Timer(value=2.0, active=False)  # stop timer
+        gr.Timer(value=2.0, active=False),  # stop timer
+        "",  # forget the batch
     )
 
 
-def wan22_stop_and_decode():
-    """Create signal file to stop generation and decode current latents."""
-    queue = get_queue()
-    running_jobs = queue.get_running_jobs()
+def wan22_stop_and_decode(current_batch_id: str):
+    """Signal this window's running jobs to stop and decode what they have.
 
+    Scoped to the caller's batch — signalling every running job would stop
+    another window's generation as well.
+    """
+    if not current_batch_id:
+        return "No attached generation to stop"
+
+    try:
+        jobs = get_queue().get_batch_jobs(current_batch_id)
+    except QueueUnavailable as e:
+        return f"Could not reach the queue: {e}"
+
+    running_jobs = [j for j in jobs if j.status == JobStatus.RUNNING.value]
     if not running_jobs:
         return "No active generation to stop"
 
@@ -192,7 +303,7 @@ def wan22_stop_and_decode():
                     f.write('decode')
                 signals_sent += 1
             except Exception as e:
-                print(f"Error creating signal file: {e}")
+                logger.error("Error creating signal file: %s", e)
 
     if signals_sent > 0:
         return f"Stop & Decode signal sent to {signals_sent} job(s)..."
@@ -784,6 +895,7 @@ def minimax_generate_via_queue(*args):
     batch_id, job_ids = minimax_submit_to_queue(*args)
     first_job_id = job_ids[0] if job_ids else ""
     status_msg = f"Queued batch {batch_id} ({len(job_ids)} job(s): {', '.join(job_ids)})"
+    logger.info("Queued batch %s with %d job(s)", batch_id, len(job_ids))
     return (
         [],
         [],
@@ -791,8 +903,62 @@ def minimax_generate_via_queue(*args):
         "Waiting for worker to start...",
         first_job_id,
         batch_id,
-        gr.Timer(value=2.0, active=True),
+        gr.Timer(value=2.0, active=bool(job_ids)),
+        batch_id if job_ids else "",
     )
+
+# ===== Instance isolation (one h3.py per GPU on the same box) =====
+INSTANCE_PORT_BASE = 7860
+INSTANCE_PORT_SPAN = 32
+_instance_lock = None  # Held for the process lifetime; never let it be collected.
+
+
+def _port_available(port: int) -> bool:
+    """Whether we could bind the port we are about to serve on."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("0.0.0.0", port))
+            return True
+        except OSError:
+            return False
+
+
+def claim_instance_port(requested: Optional[int] = None) -> int:
+    """Reserve a port for this instance and pin the queue file to it.
+
+    Gradio picks a free port itself, but only inside launch() — long after the
+    worker has already opened a queue file. Two instances would therefore share
+    wan_job_queue.json, where each new worker's startup reconciliation and each
+    poll would see the other's jobs. Claiming the port up front gives every
+    instance its own wan_job_queue_<port>.json.
+
+    The lock file is what actually serializes instances against each other; the
+    bind test only rules out unrelated processes already on the port.
+    """
+    global _instance_lock
+
+    candidates = (
+        [requested] if requested
+        else range(INSTANCE_PORT_BASE, INSTANCE_PORT_BASE + INSTANCE_PORT_SPAN)
+    )
+
+    for port in candidates:
+        lock = FileLock(os.path.join(BASE_DIR, f".instance_{port}.lock"), timeout=0.05)
+        if not lock.acquire():
+            continue  # Another h3.py owns this slot.
+        if not _port_available(port):
+            lock.release()
+            continue
+        _instance_lock = lock
+        return port
+
+    if requested:
+        raise RuntimeError(f"Port {requested} is already in use")
+    raise RuntimeError(
+        f"No free port in {INSTANCE_PORT_BASE}-{INSTANCE_PORT_BASE + INSTANCE_PORT_SPAN - 1}"
+    )
+
 
 def start_wan22_worker():
     """Start the background worker thread for processing Wan2.2 queue jobs."""
@@ -1487,6 +1653,14 @@ with gr.Blocks(
             minimax_batch_id_state = gr.State(value="")
             minimax_poll_timer = gr.Timer(value=2.0, active=False)
 
+            # gr.State dies with the gradio session, so the batch id is mirrored
+            # into browser localStorage through these two hidden boxes: _persist
+            # is written out, _restore is read back in on page load.
+            minimax_batch_persist = gr.Textbox(value="", visible=False,
+                                               elem_id="minimax_batch_persist")
+            minimax_batch_restore = gr.Textbox(value="", visible=False,
+                                               elem_id="minimax_batch_restore")
+
             with gr.Row():
                 with gr.Column():
                     minimax_task_override = gr.Dropdown(
@@ -1976,7 +2150,12 @@ with gr.Blocks(
                     interp_pyr_level,
                     interp_seed,
                 ],
-                outputs=[interp_output_video, interp_status, interp_progress]
+                outputs=[interp_output_video, interp_status, interp_progress],
+                # These generators hold their slot for the whole run. Pinning
+                # them to one shared id keeps them off the poller's slots while
+                # still letting only one heavy job run at a time.
+                concurrency_id="heavy",
+                concurrency_limit=1,
             )
 
             # Upscaling event handler
@@ -1994,7 +2173,9 @@ with gr.Blocks(
                     upscale_crf,
                     interp_seed,  # Reuse same seed
                 ],
-                outputs=[interp_output_video, interp_status, interp_progress]
+                outputs=[interp_output_video, interp_status, interp_progress],
+                concurrency_id="heavy",
+                concurrency_limit=1,
             )
 
             # Save/Load defaults
@@ -2062,6 +2243,14 @@ with gr.Blocks(
             )
 
     # ===== MiniMax Event Handlers =====
+    # Every handler that changes what this window is tracking writes the same
+    # shape, so submit / poll / stop / reattach stay in step with each other.
+    MINIMAX_TRACKING_OUTPUTS = [
+        minimax_output, minimax_preview_output, minimax_batch_progress,
+        minimax_progress_text, minimax_job_id_state, minimax_batch_id_state,
+        minimax_poll_timer, minimax_batch_persist,
+    ]
+
     minimax_generate_btn.click(
         fn=minimax_generate_via_queue,
         inputs=[
@@ -2134,30 +2323,59 @@ with gr.Blocks(
             minimax_chain_audio_context,
             minimax_chain_audio_mode,
         ],
-        outputs=[minimax_output, minimax_preview_output, minimax_batch_progress, minimax_progress_text,
-                 minimax_job_id_state, minimax_batch_id_state, minimax_poll_timer],
+        outputs=MINIMAX_TRACKING_OUTPUTS,
         queue=True
     )
 
+    # The poller must never queue behind a long interpolation/upscale job, or
+    # every open window's progress display freezes for the duration.
     minimax_poll_timer.tick(
         fn=wan22_poll_active_job,
         inputs=[minimax_job_id_state, minimax_batch_id_state],
-        outputs=[minimax_output, minimax_preview_output, minimax_batch_progress, minimax_progress_text,
-                 minimax_job_id_state, minimax_batch_id_state, minimax_poll_timer]
+        outputs=MINIMAX_TRACKING_OUTPUTS,
+        concurrency_id="poll",
+        concurrency_limit=None,
     )
 
     minimax_stop_btn.click(
         fn=wan22_stop_queue_generation,
         inputs=[minimax_batch_id_state],
-        outputs=[minimax_output, minimax_preview_output, minimax_batch_progress, minimax_progress_text,
-                 minimax_job_id_state, minimax_batch_id_state, minimax_poll_timer],
+        outputs=MINIMAX_TRACKING_OUTPUTS,
         queue=False
     )
 
     minimax_stop_decode_btn.click(
         fn=wan22_stop_and_decode,
+        inputs=[minimax_batch_id_state],
         outputs=[minimax_batch_progress],
         queue=False
+    )
+
+    # Mirror the attached batch into localStorage whenever it changes, and read
+    # it back on page load so a reload re-binds to the running generation.
+    minimax_batch_persist.change(
+        fn=None,
+        inputs=[minimax_batch_persist],
+        js="""(v) => {
+            try {
+                if (v) localStorage.setItem('h3_minimax_batch', v);
+                else localStorage.removeItem('h3_minimax_batch');
+            } catch (e) {}
+        }""",
+    )
+
+    demo.load(
+        fn=None,
+        inputs=None,
+        outputs=[minimax_batch_restore],
+        js="""() => {
+            try { return localStorage.getItem('h3_minimax_batch') || ''; }
+            catch (e) { return ''; }
+        }""",
+    ).then(
+        fn=minimax_reattach,
+        inputs=[minimax_batch_restore],
+        outputs=MINIMAX_TRACKING_OUTPUTS,
     )
 
     minimax_random_seed_btn.click(fn=set_random_seed, inputs=None, outputs=[minimax_seed])
@@ -2726,8 +2944,42 @@ with gr.Blocks(
     )
 
 
+def parse_args():
+    import argparse
+    p = argparse.ArgumentParser(description="MiniMax-H3 GUI")
+    p.add_argument("--server_port", type=int, default=None,
+                   help=f"Port to serve on. Default: first free slot from "
+                        f"{INSTANCE_PORT_BASE}. The queue file is named after it.")
+    p.add_argument("--gpu", type=str, default=None,
+                   help="GPU index for this instance (sets CUDA_VISIBLE_DEVICES).")
+    p.add_argument("--concurrency", type=int, default=8,
+                   help="Gradio default concurrency limit (default: 8).")
+    return p.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
+
+    if args.gpu is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+
     os.makedirs("outputs", exist_ok=True)
     os.makedirs("temp_frames", exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
+
+    # Claim the port before anything opens the queue: set_queue_port decides the
+    # queue filename, and get_queue() caches it on first call.
+    port = claim_instance_port(args.server_port)
+    set_queue_port(port)
+    setup_logging(port)
+
+    logger.info("Starting h3 on port %d (GPU %s, queue %s)",
+                port, os.environ.get("CUDA_VISIBLE_DEVICES", "all"),
+                get_queue().queue_file)
+
     start_wan22_worker()
-    demo.queue().launch(server_name="0.0.0.0", share=False)
+    demo.queue(default_concurrency_limit=args.concurrency).launch(
+        server_name="0.0.0.0",
+        server_port=port,
+        share=False,
+    )

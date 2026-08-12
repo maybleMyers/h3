@@ -29,6 +29,14 @@ class JobStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class QueueUnavailable(Exception):
+    """The queue file could not be read or locked.
+
+    Distinct from an empty queue: callers must never read this as "the job is
+    gone", or a transient I/O hiccup would look like a cancellation.
+    """
+
+
 @dataclass
 class Job:
     """Represents a video generation job."""
@@ -79,77 +87,83 @@ class Job:
 
 class FileLock:
     """
-    Cross-platform file lock implementation.
-    Uses lock files rather than OS-specific file locking.
+    Cross-platform advisory file lock backed by the OS.
+
+    Uses fcntl.flock on POSIX and msvcrt.locking on Windows rather than the
+    presence of a lock file. Creating a lock file exclusively and then writing
+    the owner pid into it are two separate syscalls, so a competing process can
+    read the file while it is still empty, conclude the lock is corrupt, and
+    delete it out from under the live holder — which is how two writers end up
+    inside the same read-modify-write and lose each other's jobs.
+
+    The lock file is never unlinked. Deleting it while another process holds a
+    descriptor on it would let a third process create a fresh inode and lock
+    that instead, defeating the whole mechanism.
     """
 
     def __init__(self, lock_file: str, timeout: float = 10.0):
         self.lock_file = lock_file
         self.timeout = timeout
-        self._lock_acquired = False
+        self._fd = None
+
+    def _try_lock(self, fd) -> bool:
+        try:
+            if os.name == 'nt':
+                import msvcrt
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
 
     def acquire(self) -> bool:
-        """Try to acquire the lock."""
-        start_time = time.time()
-        while time.time() - start_time < self.timeout:
-            try:
-                # Try to create lock file exclusively
-                fd = os.open(self.lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                os.write(fd, str(os.getpid()).encode())
-                os.close(fd)
-                self._lock_acquired = True
-                return True
-            except FileExistsError:
-                # Lock file exists - check if the process holding it is still alive
+        """Try to acquire the lock, polling until the timeout expires."""
+        if self._fd is not None:
+            return True
+
+        try:
+            fd = os.open(self.lock_file, os.O_CREAT | os.O_RDWR, 0o666)
+        except OSError:
+            return False
+
+        deadline = time.time() + self.timeout
+        while True:
+            if self._try_lock(fd):
+                self._fd = fd
                 try:
-                    with open(self.lock_file, 'r') as f:
-                        pid = int(f.read().strip())
-                    # Check if process is still running (works on both Windows and Linux)
-                    if not self._is_process_running(pid):
-                        # Stale lock - remove it
-                        os.remove(self.lock_file)
-                        continue
-                except (ValueError, FileNotFoundError, PermissionError):
-                    # Lock file corrupted or disappeared - try again
-                    try:
-                        os.remove(self.lock_file)
-                    except:
-                        pass
-                    continue
+                    os.truncate(fd, 0)
+                    os.write(fd, str(os.getpid()).encode())
+                except OSError:
+                    pass  # Owner pid is a debugging aid, not the lock itself.
+                return True
 
-                # Process is still running, wait a bit
-                time.sleep(0.05)
-            except Exception as e:
-                time.sleep(0.05)
-
-        return False
+            if time.time() >= deadline:
+                os.close(fd)
+                return False
+            time.sleep(0.01)
 
     def release(self) -> None:
         """Release the lock."""
-        if self._lock_acquired:
-            try:
-                os.remove(self.lock_file)
-            except:
-                pass
-            self._lock_acquired = False
-
-    @staticmethod
-    def _is_process_running(pid: int) -> bool:
-        """Check if a process is running."""
+        if self._fd is None:
+            return
         try:
-            if os.name == 'nt':  # Windows
-                import ctypes
-                kernel32 = ctypes.windll.kernel32
-                handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
-                if handle:
-                    kernel32.CloseHandle(handle)
-                    return True
-                return False
-            else:  # Unix
-                os.kill(pid, 0)
-                return True
-        except (OSError, ProcessLookupError):
-            return False
+            if os.name == 'nt':
+                import msvcrt
+                os.lseek(self._fd, 0, os.SEEK_SET)
+                msvcrt.locking(self._fd, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
 
     def __enter__(self):
         if not self.acquire():
@@ -180,39 +194,67 @@ class JobQueue:
 
     @contextmanager
     def _file_lock(self):
-        """Context manager for file locking."""
+        """Context manager for file locking.
+
+        Raises QueueUnavailable rather than proceeding unlocked: every mutation
+        here is a read-modify-write of the whole file, so an unlocked write
+        silently drops other writers' jobs.
+        """
         lock = FileLock(self.lock_file, self.lock_timeout)
+        if not lock.acquire():
+            raise QueueUnavailable(
+                f"Could not acquire lock on {self.lock_file} within {self.lock_timeout}s"
+            )
         try:
-            lock.acquire()
             yield
         finally:
             lock.release()
 
-    def _load_jobs(self) -> Dict[str, Dict]:
-        """Load all jobs from the queue file."""
-        try:
-            with open(self.queue_file, 'r', encoding='utf-8') as f:
-                content = f.read()
+    def _load_jobs(self, retries: int = 4) -> Dict[str, Dict]:
+        """Load all jobs from the queue file.
+
+        A missing or unparseable file is a failure, not an empty queue — it
+        raises QueueUnavailable after retrying. Only a file that exists and
+        holds valid (possibly empty) JSON counts as empty.
+        """
+        last_error = None
+        for attempt in range(retries):
+            try:
+                with open(self.queue_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
                 if not content.strip():
                     return {}
                 return json.loads(content)
-        except FileNotFoundError:
-            return {}
-        except json.JSONDecodeError:
-            print(f"Warning: Corrupted queue file, returning empty queue")
-            return {}
+            except (FileNotFoundError, json.JSONDecodeError, OSError) as e:
+                last_error = e
+                if attempt < retries - 1:
+                    time.sleep(0.05 * (attempt + 1))
+
+        raise QueueUnavailable(f"Could not read {self.queue_file}: {last_error}")
 
     def _save_jobs(self, jobs: Dict[str, Dict]) -> None:
-        """Save all jobs to the queue file."""
-        # Write to temp file first, then rename (atomic on most systems)
-        temp_file = self.queue_file + ".tmp"
-        with open(temp_file, 'w', encoding='utf-8') as f:
-            json.dump(jobs, f, indent=2)
+        """Save all jobs to the queue file.
 
-        # On Windows, need to remove target first
-        if os.path.exists(self.queue_file):
-            os.remove(self.queue_file)
-        os.rename(temp_file, self.queue_file)
+        The temp name is per-writer so two writers can never interleave into the
+        same scratch file, and on POSIX the rename alone is atomic — removing the
+        target first would open a window where the queue file does not exist.
+        """
+        temp_file = f"{self.queue_file}.{os.getpid()}.{threading.get_ident()}.tmp"
+        try:
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(jobs, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+
+            if os.name == 'nt' and os.path.exists(self.queue_file):
+                os.remove(self.queue_file)
+            os.rename(temp_file, self.queue_file)
+        except Exception:
+            try:
+                os.remove(temp_file)
+            except OSError:
+                pass
+            raise
 
     def add_job(self,
                 command: List[str],
@@ -288,6 +330,10 @@ class JobQueue:
         """
         Get the next pending job in the queue (FIFO order).
 
+        Read-only peek. Workers must use claim_next_pending() instead — peeking
+        and marking in two separate lock acquisitions lets two workers grab the
+        same job.
+
         Returns:
             The oldest pending job or None if queue is empty
         """
@@ -304,6 +350,39 @@ class JobQueue:
             # Sort by creation time and return oldest
             pending.sort(key=lambda x: x.created_at)
             return pending[0]
+
+    def claim_next_pending(self) -> Optional[Job]:
+        """
+        Atomically take the oldest pending job and mark it RUNNING.
+
+        Select and claim happen under one lock, so two workers sharing a queue
+        file can never run the same job. `process_id` is filled in later by
+        Worker.attach_process once the subprocess exists.
+
+        Returns:
+            The claimed Job (already RUNNING) or None if nothing is pending
+        """
+        with self._thread_lock:
+            with self._file_lock():
+                jobs = self._load_jobs()
+                pending = [
+                    (data['created_at'], job_id)
+                    for job_id, data in jobs.items()
+                    if data['status'] == JobStatus.PENDING.value
+                ]
+
+                if not pending:
+                    return None
+
+                pending.sort()
+                job_id = pending[0][1]
+                jobs[job_id].update(
+                    status=JobStatus.RUNNING.value,
+                    started_at=time.time(),
+                )
+                self._save_jobs(jobs)
+
+                return Job.from_dict(jobs[job_id])
 
     def get_running_jobs(self) -> List[Job]:
         """Get all currently running jobs."""
@@ -393,6 +472,15 @@ class JobQueue:
             started_at=time.time(),
             process_id=process_id
         )
+
+    def attach_process(self, job_id: str, process_id: int) -> Optional[Job]:
+        """Record the subprocess pid on an already-claimed job.
+
+        Does not touch status — the job was set RUNNING by claim_next_pending()
+        before the subprocess existed, so a cancel that lands in between is not
+        overwritten here.
+        """
+        return self.update_job(job_id, process_id=process_id)
 
     def mark_completed(self, job_id: str, return_code: int = 0) -> Optional[Job]:
         """Mark a job as completed."""
