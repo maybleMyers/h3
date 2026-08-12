@@ -1672,12 +1672,11 @@ with gr.Blocks(
                     gr.Markdown("### Keyframes (fl2va)")
                     with gr.Row():
                         minimax_input_image = gr.Image(
-                            label="First Frame (stretched onto the canvas; sets the aspect ratio)",
+                            label="First Frame",
                             type="filepath",
                         )
                         minimax_last_image = gr.Image(
-                            label="Last Frame (cover-cropped; can be used on its own; while chaining it pins "
-                                  "the end of the last segment)",
+                            label="Last Frame",
                             type="filepath",
                         )
 
