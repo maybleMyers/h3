@@ -74,7 +74,21 @@ def _from_config(cls, config_path, torch_dtype, overrides=None):
     with init_empty_weights():
         model = cls.from_config(config)
     if torch_dtype is not None:
+        # `init_empty_weights` sends parameters to meta but leaves buffers real, so `.to(dtype)`
+        # casts them for real — and a non-persistent buffer is absent from the checkpoint, so the
+        # `load_state_dict(assign=True)` below cannot restore it (`rope.inv_freq` was silently
+        # ending up bfloat16). Hold the buffers of the modules the class declares float32 and put
+        # the originals back; re-casting the downcast tensor would only return rounded values.
+        keep = getattr(cls, "_keep_in_fp32_modules", None) or []
+        held = {
+            name: buf
+            for name, buf in model.named_buffers()
+            if buf.is_floating_point() and any(k in name for k in keep)
+        }
         model = model.to(torch_dtype)
+        for name, buf in held.items():
+            parent, _, attr = name.rpartition(".")
+            setattr(model.get_submodule(parent) if parent else model, attr, buf)
     return model
 
 

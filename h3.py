@@ -1899,7 +1899,7 @@ with gr.Blocks(
                                     value="None", allow_custom_value=False, interactive=True, scale=2,
                                 ))
                                 minimax_lora_multipliers.append(gr.Number(
-                                    label="Multiplier", value=1.0, scale=1, interactive=True,
+                                    label="Multiplier", value=1.0, step=0.1, scale=1, interactive=True,
                                 ))
 
             with gr.Accordion("Model Paths", open=True):
