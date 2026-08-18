@@ -9,7 +9,26 @@ import logging
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-from utils.safetensors_utils import MemoryEfficientSafeOpen, load_safetensors, stream_safetensors
+from utils.safetensors_utils import (
+    MemoryEfficientSafeOpen,
+    load_safetensors,
+    safetensors_key_count,
+    stream_safetensors,
+)
+
+
+def _load_progress(model_file: str, suffix: str = ""):
+    """Throttled load bar. maxinterval=inf keeps tqdm's monitor thread from resetting miniters to 1."""
+    return {
+        "desc": f"Loading {os.path.basename(model_file)}{suffix}",
+        "total": safetensors_key_count(model_file),
+        "leave": False,
+        "miniters": 100,
+        "mininterval": 5.0,
+        "maxinterval": float("inf"),
+        "file": sys.stdout,
+        "dynamic_ncols": False,
+    }
 
 
 def filter_lora_state_dict(
@@ -112,7 +131,7 @@ def load_safetensors_with_lora_and_fp8(
         # No LoRA weights, just load the model normally
         state_dict = {}
         for model_file in model_files:
-            for key, value in tqdm(stream_safetensors(model_file), desc=f"Loading {os.path.basename(model_file)}", leave=False, miniters=100, file=sys.stdout, dynamic_ncols=False):
+            for key, value in tqdm(stream_safetensors(model_file), **_load_progress(model_file)):
                 if move_to_device:
                     value = value.to(calc_device)
                 state_dict[key] = value
@@ -350,7 +369,7 @@ def load_safetensors_with_lora_and_fp8(
     # Load model with LoRA merging hook
     state_dict = {}
     for model_file in model_files:
-        for key, value in tqdm(stream_safetensors(model_file), desc=f"Loading {os.path.basename(model_file)} with LoRA merge", leave=False, miniters=100, file=sys.stdout, dynamic_ncols=False):
+        for key, value in tqdm(stream_safetensors(model_file), **_load_progress(model_file, " with LoRA merge")):
             value = weight_hook_func(key, value)
 
             if move_to_device:

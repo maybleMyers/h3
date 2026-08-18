@@ -191,6 +191,12 @@ def _should_drop_page_cache(path: str) -> bool:
     return os.path.getsize(path) >= (1 << 30)
 
 
+def safetensors_key_count(path: str) -> int:
+    """Number of tensors in a safetensors file (header read only)."""
+    with MemoryEfficientSafeOpen(path) as f:
+        return len(f.keys())
+
+
 def stream_safetensors(
     path: str,
     num_threads: Optional[int] = None,

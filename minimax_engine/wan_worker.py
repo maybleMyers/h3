@@ -119,17 +119,26 @@ class Worker:
             return False
         # Check for model loading progress bars (tqdm format)
         # e.g., "Loading wan22_i2v_14B_high_noise_fp32_and_fp16.safetensors with LoRA merge:  69%|██████▊   | 752/1095"
+        # or, when the bar has no total, "... with LoRA merge: 541it [01:01, 7.51it/s]"
         if "Loading" in line and ("with LoRA merge" in line or "safetensors" in line):
-            # Extract current step from tqdm format: | current/total
             match = re.search(r'\|\s*(\d+)/(\d+)', line)
             if match:
                 current_step = int(match.group(1))
                 total_steps = int(match.group(2))
-                # Only print at 0%, every 100 steps, or at 100%
-                if current_step == 0 or current_step >= total_steps or current_step - self._last_loading_step >= 100:
-                    self._last_loading_step = current_step
+            else:
+                match = re.search(r'(\d+)it\s*\[', line)
+                if not match:
                     return True
-                return False
+                current_step = int(match.group(1))
+                total_steps = 0
+            # A counter that moved backwards means a new bar (next shard, next job)
+            if current_step < self._last_loading_step:
+                self._last_loading_step = -100
+            # Only print at 0%, every 100 steps, or at 100%
+            if current_step == 0 or (total_steps and current_step >= total_steps) or current_step - self._last_loading_step >= 100:
+                self._last_loading_step = current_step
+                return True
+            return False
         return True
 
     def parse_progress_line(self, line: str) -> Tuple[Optional[float], Optional[str], int, int]:
