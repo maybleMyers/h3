@@ -24,6 +24,8 @@ dependencies = [
     "transformers",
     "accelerate",
     "diffusers",
+    # alternative DiT offload engine (import diffusers_mm)
+    "diffusers-mm",
     "av",
     "rich",
     # Frame interpolation / upscaling (GIMM-VFI, BiM-VFI, ESRGAN/SwinIR/BasicVSR++)
