@@ -815,6 +815,9 @@ def run_one(args, task, device, seed, extra_references=None, motion_context=None
 
     if mm is not None:
         mm.unregister_component("transformer")  # removes the offload hooks and the manager's own refs
+        # the offloader's own state cycles back to the module, so the weights would only leave the
+        # GPU whenever the cycle collector gets around to it; drop the storages here instead
+        transformer.to_empty(device="meta")
         release_host_cache = mm.release_host_cache
         mm = None
     else:
