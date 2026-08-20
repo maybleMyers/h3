@@ -741,7 +741,6 @@ def minimax_submit_to_queue(
             "--infer_steps", str(int(infer_steps)),
             "--num_outputs", str(int(num_outputs)),
             "--attn_mode", str(attn_mode),
-            "--blocks_to_swap", str(int(blocks_to_swap)),
             "--act_chunk_rows", str(int(act_chunk_rows) if act_chunk_rows is not None else 0),
             "--dit_dtype", str(dit_dtype),
             "--vae_dtype", str(vae_dtype),
@@ -811,6 +810,8 @@ def minimax_submit_to_queue(
             command.append("--classic_block_swap")
         if offload_engine == "diffusers-mm":
             command.extend(["--offload_engine", "diffusers_mm", "--mm_strategy", str(mm_strategy)])
+        else:
+            command.extend(["--blocks_to_swap", str(int(blocks_to_swap))])
         if vae_tiling:
             command.append("--vae_tiling")
         if compile_enabled:

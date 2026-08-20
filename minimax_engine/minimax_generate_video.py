@@ -369,19 +369,30 @@ def encode_prompt_stage(args, task, plan, prompt, device):
 # ---------------------------------------------------------------------------
 
 
-def _apply_diffusers_mm(transformer, strategy, device):
-    """Offload the DiT via the diffusers-mm ModelManager instead of the built-in block swap."""
+def _apply_diffusers_mm(transformer, strategy, device, seq_len):
+    """Offload the DiT via the diffusers-mm ModelManager instead of the built-in block swap.
+
+    The activation fit is diffusers-mm's own measurement for MiniMax-H3, passed through the
+    ctor overrides because its model profile is only adopted by whole-pipeline registration.
+    `seq_len` is the packed sequence the resolver budgets the working set against, so this
+    runs after the layout is built rather than at load time.
+    """
     try:
         from diffusers_mm import ModelManager
     except ImportError as e:
         raise RuntimeError(
             "diffusers-mm offload engine selected but not installed: pip install diffusers-mm"
         ) from e
-    mm = ModelManager(strategy=strategy, device=str(device))
+    mm = ModelManager(
+        strategy=strategy,
+        auto_block_pin_act_slope_gb_per_ktoken=0.158,
+        auto_block_pin_act_safety_factor=1.2,
+    )
     mm.register_component("transformer", transformer)
-    mm.apply_offload_strategy(device)
-    transformer._mm = mm  # keep the offload hooks alive for the run
-    logger.info(f"diffusers-mm offload engine active (strategy={strategy})")
+    mm.set_block_pin_workload(seq_len, 1)
+    resolved = mm.apply_offload_strategy(device)
+    logger.info(f"diffusers-mm offload engine active (strategy={resolved}, seq_len={seq_len})")
+    return mm
 
 
 def load_transformer_stage(args, task, device):
@@ -463,7 +474,13 @@ def load_transformer_stage(args, task, device):
                 f"dense_blocks={args.sol_dense_blocks}, min_tokens={args.sol_min_tokens}"
             )
     if args.offload_engine == "diffusers_mm":
-        _apply_diffusers_mm(transformer, args.mm_strategy, device)
+        # the DiT stays on CPU: diffusers-mm places it in run_one, once the packed
+        # sequence length the strategy is budgeted against is known
+        if args.blocks_to_swap and args.blocks_to_swap > 0:
+            logger.warning(
+                f"--offload_engine diffusers_mm manages the DiT: --blocks_to_swap "
+                f"{args.blocks_to_swap} is ignored"
+            )
     elif args.blocks_to_swap and args.blocks_to_swap > 0:
         transformer.enable_block_swap(
             args.blocks_to_swap, device, supports_backward=False, streaming=not args.classic_block_swap
@@ -748,6 +765,9 @@ def run_one(args, task, device, seed, extra_references=None, motion_context=None
     pipe.patch_size = tuple(transformer.config.patch_size)
 
     layout = pipe.build_layout(plan, text_token_tags)
+    mm = None
+    if args.offload_engine == "diffusers_mm":
+        mm = _apply_diffusers_mm(transformer, args.mm_strategy, device, layout.sequence_length)
     latents, audio_latents = pipe.prepare_latents(
         plan,
         generator=generator,
@@ -793,9 +813,17 @@ def run_one(args, task, device, seed, extra_references=None, motion_context=None
                 f"(stats: {SOL_CTX.stats})"
             )
 
+    if mm is not None:
+        mm.unregister_component("transformer")  # removes the offload hooks and the manager's own refs
+        release_host_cache = mm.release_host_cache
+        mm = None
+    else:
+        release_host_cache = None
     del transformer
     pipe.transformer = None
     gc.collect()  # int8/fp8-patched modules sit in reference cycles; free them before the VAEs return
+    if release_host_cache is not None:
+        release_host_cache()  # gc does not return the group-offload pinned host pool
     clean_memory_on_device(device)
 
     # Stage D: VAEs back -> decode + save.
