@@ -21,6 +21,7 @@ einops
 transformers
 accelerate
 diffusers
+diffusers-mm   # optional: alternative DiT offload engine (import diffusers_mm)
 av
 rich
 

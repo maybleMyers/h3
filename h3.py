@@ -2,8 +2,6 @@
 # Assembled from H1111/h1111.py (branch h3 @ ece03a2); backend lives in minimax_engine/.
 import os
 
-# Offline by default: no telemetry ping, no PyPI version check, no font fetch.
-# Must precede the gradio/huggingface imports — both read these at import time.
 os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
 os.environ.setdefault("DO_NOT_TRACK", "1")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
@@ -553,6 +551,8 @@ def minimax_submit_to_queue(
     sol_tau: float,
     blocks_to_swap: int,
     classic_block_swap: bool,
+    offload_engine: str,
+    mm_strategy: str,
     act_chunk_rows,
     fp8: bool,
     fp8_scaled: bool,
@@ -809,6 +809,8 @@ def minimax_submit_to_queue(
             command.append("--int8_fast")
         if classic_block_swap:
             command.append("--classic_block_swap")
+        if offload_engine == "diffusers-mm":
+            command.extend(["--offload_engine", "diffusers_mm", "--mm_strategy", str(mm_strategy)])
         if vae_tiling:
             command.append("--vae_tiling")
         if compile_enabled:
@@ -1550,7 +1552,7 @@ with gr.Blocks(
 
     demo.load(None, None, None, js=r"""
         () => {
-            document.title = 'H1111';
+            document.title = 'h3';
 
             // A file dropped outside an upload zone would otherwise navigate the
             // browser to the file, wiping out the page. Swallow stray drops at the
@@ -1583,21 +1585,21 @@ with gr.Blocks(
                     // Try queue format first: "XX% ... ETA: HH:MM:SS"
                     let match = text.match(/(\d+)%.*?ETA:\s*([\d:]+)/);
                     if (match) {
-                        document.title = `[${match[1]}% ETA: ${match[2]}] - H1111`;
+                        document.title = `[${match[1]}% ETA: ${match[2]}] - h3`;
                         return;
                     }
 
                     // Try raw TQDM format: "XX%|...[...<HH:MM:SS"
                     match = text.match(/(\d+)%\|.*\[.*<([\d:?]+)/);
                     if (match) {
-                        document.title = `[${match[1]}% ETA: ${match[2]}] - H1111`;
+                        document.title = `[${match[1]}% ETA: ${match[2]}] - h3`;
                         return;
                     }
                 }
                 // Reset title if no progress info found and we had progress before
                 if (!text || !text.trim()) {
-                    if (document.title !== 'H1111') {
-                        document.title = 'H1111';
+                    if (document.title !== 'h3') {
+                        document.title = 'h3';
                     }
                 }
             }
@@ -1991,6 +1993,18 @@ with gr.Blocks(
                         value=False,
                         info="Function-level JIT compile. Compatible with all dtypes and block swap. First run slower."
                     )
+                with gr.Row():
+                    minimax_offload_engine = gr.Dropdown(
+                        label="Offload Engine",
+                        choices=["Block Swap", "diffusers-mm"],
+                        value="Block Swap",
+                        info="diffusers-mm manages DiT offload instead of block swap",
+                    )
+                    minimax_mm_strategy = gr.Dropdown(
+                        label="diffusers-mm Strategy",
+                        choices=["auto", "no_offload", "model_offload", "block_pin", "group_offload"],
+                        value="auto",
+                    )
                 minimax_save_path = gr.Textbox(label="Save Path", value="outputs")
                 with gr.Row():
                     minimax_save_defaults_btn = gr.Button("Save Defaults")
@@ -2344,6 +2358,8 @@ with gr.Blocks(
             minimax_sol_tau,
             minimax_blocks_to_swap,
             minimax_classic_block_swap,
+            minimax_offload_engine,
+            minimax_mm_strategy,
             minimax_act_chunk_rows,
             minimax_fp8,
             minimax_fp8_scaled,
@@ -2630,6 +2646,8 @@ with gr.Blocks(
         minimax_sol_tau,
         minimax_blocks_to_swap,
         minimax_classic_block_swap,
+        minimax_offload_engine,
+        minimax_mm_strategy,
         minimax_act_chunk_rows,
         minimax_fp8,
         minimax_fp8_scaled,
@@ -2675,6 +2693,8 @@ with gr.Blocks(
         "minimax_sol_tau",
         "minimax_blocks_to_swap",
         "minimax_classic_block_swap",
+        "minimax_offload_engine",
+        "minimax_mm_strategy",
         "minimax_act_chunk_rows",
         "minimax_fp8",
         "minimax_fp8_scaled",

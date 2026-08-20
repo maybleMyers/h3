@@ -153,6 +153,11 @@ def parse_args() -> argparse.Namespace:
                         help="0-49 transformer blocks kept on CPU (pinned) and streamed through the GPU")
     parser.add_argument("--classic_block_swap", action="store_true",
                         help="use the legacy rolling block swap instead of pinned sub-block weight streaming")
+    parser.add_argument("--offload_engine", choices=["blockswap", "diffusers_mm"], default="blockswap",
+                        help="DiT offload backend: 'blockswap' (built-in) or 'diffusers_mm' (diffusers-mm package)")
+    parser.add_argument("--mm_strategy", default="auto",
+                        choices=["auto", "no_offload", "model_offload", "block_pin", "group_offload"],
+                        help="diffusers-mm offload strategy (only with --offload_engine diffusers_mm)")
     parser.add_argument("--act_chunk_rows", type=int, default=32768,
                         help="process row-wise ops (AdaLN, rotary, FF, output heads) in slices of this many rows "
                              "of the packed sequence to bound activation peaks; 0 = off")
@@ -364,6 +369,21 @@ def encode_prompt_stage(args, task, plan, prompt, device):
 # ---------------------------------------------------------------------------
 
 
+def _apply_diffusers_mm(transformer, strategy, device):
+    """Offload the DiT via the diffusers-mm ModelManager instead of the built-in block swap."""
+    try:
+        from diffusers_mm import ModelManager
+    except ImportError as e:
+        raise RuntimeError(
+            "diffusers-mm offload engine selected but not installed: pip install diffusers-mm"
+        ) from e
+    mm = ModelManager(strategy=strategy, device=str(device))
+    mm.register_component("transformer", transformer)
+    mm.apply_offload_strategy(device)
+    transformer._mm = mm  # keep the offload hooks alive for the run
+    logger.info(f"diffusers-mm offload engine active (strategy={strategy})")
+
+
 def load_transformer_stage(args, task, device):
     from minimax_video import attention as minimax_attention
     from minimax_video import transformer as minimax_transformer
@@ -442,7 +462,9 @@ def load_transformer_stage(args, task, device):
                 f"sol-attn enabled: tau={args.sol_tau}, dense_steps={args.sol_dense_steps}, "
                 f"dense_blocks={args.sol_dense_blocks}, min_tokens={args.sol_min_tokens}"
             )
-    if args.blocks_to_swap and args.blocks_to_swap > 0:
+    if args.offload_engine == "diffusers_mm":
+        _apply_diffusers_mm(transformer, args.mm_strategy, device)
+    elif args.blocks_to_swap and args.blocks_to_swap > 0:
         transformer.enable_block_swap(
             args.blocks_to_swap, device, supports_backward=False, streaming=not args.classic_block_swap
         )
