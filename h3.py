@@ -90,6 +90,16 @@ def format_elapsed_time(seconds: float) -> str:
     return f"{h}h {m:02d}m"
 
 
+def minimax_output_frames(output_filename: str) -> List[str]:
+    """Every file one job produced: an mp4 as itself, an image-mode still as its whole PNG run."""
+    if not output_filename.endswith("_0000.png"):
+        return [output_filename]
+    import glob
+
+    stem = output_filename[: -len("_0000.png")]
+    return sorted(glob.glob(f"{stem}_[0-9][0-9][0-9][0-9].png"))
+
+
 def _render_batch(jobs: List[Job]):
     """Build the gallery/status view for one batch.
 
@@ -110,7 +120,12 @@ def _render_batch(jobs: List[Job]):
                 caption = f"Seed: {seed}"
                 if job.elapsed_time:
                     caption += f" | {format_elapsed_time(job.elapsed_time)}"
-                all_videos.append((job.output_filename, caption))
+                # An image-mode job registers its first still; the rest sit next to it.
+                frames = minimax_output_frames(job.output_filename)
+                for index, path in enumerate(frames):
+                    all_videos.append(
+                        (path, f"{caption} | frame {index}" if len(frames) > 1 else caption)
+                    )
         elif job.status == JobStatus.RUNNING.value:
             running_job = job
             if job.preview_path and os.path.exists(job.preview_path):
@@ -321,6 +336,10 @@ MINIMAX_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".
 MINIMAX_AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wma"}
 
 
+# Image mode: the fewest frames the video VAE can encode (17n+5 with n=0).
+MINIMAX_IMAGE_MODE_FRAMES = 5
+
+
 def minimax_align_num_frames(num_frames: int) -> int:
     """Snap a frame count up to the next 17n+5 the MiniMax-H3 video VAE can encode."""
     num_frames = max(1, int(num_frames))
@@ -527,6 +546,7 @@ def minimax_submit_to_queue(
     width,
     height,
     video_length,
+    image_mode: bool,
     infer_steps: int,
     flow_shift,
     audio_flow_shift,
@@ -655,9 +675,16 @@ def minimax_submit_to_queue(
         if chain_mode != "motion" and len(ref_kinds) > 11:
             raise gr.Error("Chaining adds a reference per segment: at most 11 references")
 
+    # Image mode drives the model as a still generator: the 5 frame VAE minimum, written as PNGs.
+    image_mode = bool(image_mode)
+    if image_mode and chaining:
+        raise gr.Error("Image Mode generates a single 5-frame still batch; turn Chaining off")
+
     # Frame count: 17n+5 at 24 fps, 4-30 s. 0/blank on ref2va = derive from the audio reference.
     video_length = opt_number(video_length)
-    if video_length is not None:
+    if image_mode:
+        video_length = MINIMAX_IMAGE_MODE_FRAMES
+    elif video_length is not None:
         video_length = minimax_align_num_frames(video_length)
         if not 107 <= video_length <= 719:
             raise gr.Error(
@@ -729,7 +756,11 @@ def minimax_submit_to_queue(
             current_seed = base_seed + i
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_filename = os.path.join(save_path, f"minimax_{task_name}_{timestamp}_{current_seed}.mp4")
+        stem = os.path.join(save_path, f"minimax_{task_name}_{timestamp}_{current_seed}")
+        # The engine strips the extension and numbers the stills from it; the job has to name a
+        # file that really appears, or the worker never marks it completed.
+        output_filename = stem + (".png" if image_mode else ".mp4")
+        job_output_filename = stem + "_0000.png" if image_mode else output_filename
         run_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
         unique_preview_suffix = f"minimax_{run_id}"
 
@@ -745,10 +776,12 @@ def minimax_submit_to_queue(
             "--dit_dtype", str(dit_dtype),
             "--vae_dtype", str(vae_dtype),
             "--save_path", str(save_path),
-            "--output_type", "video",
+            "--output_type", "images" if image_mode else "video",
             "--output_filename", output_filename,
             "--video_length", str(int(video_length) if video_length is not None else 0),
         ]
+        if image_mode:
+            command.append("--allow_short")
 
         if width is not None and height is not None:
             command.extend(["--video_size", str(height), str(width)])
@@ -870,6 +903,8 @@ def minimax_submit_to_queue(
             "compile": compile_enabled,
             "save_path": save_path,
         }
+        if image_mode:
+            parameters["image_mode"] = True
         if input_image:
             parameters["image_path"] = input_image
         if last_image:
@@ -891,7 +926,7 @@ def minimax_submit_to_queue(
         job = queue.add_job(
             command=command,
             parameters=parameters,
-            output_filename=output_filename,
+            output_filename=job_output_filename,
             batch_id=batch_id,
             batch_index=i,
             batch_total=batch_count,
@@ -1781,6 +1816,13 @@ with gr.Blocks(
                         choices=MINIMAX_VIDEO_LENGTH_CHOICES,
                         value=124,
                     )
+                    minimax_image_mode = gr.Checkbox(
+                        label=f"Image Mode ({MINIMAX_IMAGE_MODE_FRAMES} frames → PNG)", value=False,
+                        info=f"use H3 as an image model: generate the {MINIMAX_IMAGE_MODE_FRAMES} frame VAE "
+                             "minimum and save every frame as a PNG. No mp4, no soundtrack; Video Length and "
+                             "Chaining do not apply. The checkpoint is trained on 4-30 s, so still quality "
+                             "here is experimental.",
+                    )
                     minimax_infer_steps = gr.Slider(
                         minimum=2, maximum=100, step=1, label="Sampling Steps (model evals = steps − 1)",
                         value=50,
@@ -2335,6 +2377,7 @@ with gr.Blocks(
             minimax_width,
             minimax_height,
             minimax_video_length,
+            minimax_image_mode,
             minimax_infer_steps,
             minimax_flow_shift,
             minimax_audio_flow_shift,
@@ -2610,6 +2653,22 @@ with gr.Blocks(
         outputs=[minimax_chain_accordion],
     )
 
+    def minimax_toggle_image_mode(enabled):
+        """Grey out what image mode overrides, and hide Stop & Decode: its signal file is keyed to
+        the engine's --output_filename, which the PNG run names differently."""
+        enabled = bool(enabled)
+        return (
+            gr.update(interactive=not enabled),  # video length
+            gr.update(interactive=not enabled),  # chaining
+            gr.update(visible=not enabled),      # stop & decode
+        )
+
+    minimax_image_mode.change(
+        fn=minimax_toggle_image_mode,
+        inputs=[minimax_image_mode],
+        outputs=[minimax_video_length, minimax_chain_enable, minimax_stop_decode_btn],
+    )
+
     def minimax_chain_budget_text(mode, count, length, context_length, extend):
         if mode != "motion":
             return ""
@@ -2664,6 +2723,7 @@ with gr.Blocks(
         minimax_save_path,
         minimax_lora_folder,
         minimax_video_length,
+        minimax_image_mode,
         minimax_infer_steps,
         minimax_flow_shift,
         minimax_audio_flow_shift,
@@ -2711,6 +2771,7 @@ with gr.Blocks(
         "minimax_save_path",
         "minimax_lora_folder",
         "minimax_video_length",
+        "minimax_image_mode",
         "minimax_infer_steps",
         "minimax_flow_shift",
         "minimax_audio_flow_shift",

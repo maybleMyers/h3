@@ -39,7 +39,14 @@ def get_ffmpeg_path():
 
 
 def add_metadata_to_video(video_path: str, parameters: dict) -> None:
-    """Add generation parameters to video metadata using ffmpeg."""
+    """Add generation parameters to video metadata using ffmpeg.
+
+    Non-mp4 outputs (image mode writes PNGs, which carry their own metadata) are left alone:
+    the temp path below would collapse onto the output itself and the failure branch would
+    delete it.
+    """
+    if not video_path.lower().endswith(".mp4"):
+        return
     params_json = json.dumps(parameters, indent=2)
     temp_path = video_path.replace(".mp4", "_temp.mp4")
 
@@ -220,6 +227,8 @@ class Worker:
         # Video saved
         if "Video saved to" in line or "Generated video is saved to" in line:
             return 100.0, "Video saved successfully!", 0, 0
+        if "Images saved to" in line:
+            return 100.0, "Images saved successfully!", 0, 0
 
         # VAE decoding
         if "Decoding" in line or "VAE" in line.upper() or "decoding video" in line.lower():

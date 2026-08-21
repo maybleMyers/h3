@@ -109,6 +109,7 @@ class MiniMaxH3Pipeline:
         vae_spatial_compression_ratio: int = 16,
         audio_latent_channels: int = 32,
         audio_sampling_rate: int = 32000,
+        allow_short_clips: bool = False,
     ):
         self.vae = vae
         self.audio_vae = audio_vae
@@ -127,6 +128,8 @@ class MiniMaxH3Pipeline:
             audio_vae.config.latent_channels if audio_vae is not None else audio_latent_channels
         )
         self.audio_sampling_rate = audio_vae.config.sampling_rate if audio_vae is not None else audio_sampling_rate
+        # Image mode asks for the 5 frame VAE minimum, far below the trained 4 s floor.
+        self.allow_short_clips = allow_short_clips
 
     # ------------------------------------------------------------------ setup
 
@@ -143,15 +146,15 @@ class MiniMaxH3Pipeline:
                 f"`height` and `width` must be multiples of {MINIMAX_H3_CANVAS_MULTIPLE}, got {height}x{width}."
             )
 
-    @staticmethod
-    def _check_duration(num_frames):
+    def _check_duration(self, num_frames):
         aligned = align_num_frames(num_frames)
         duration = aligned / MINIMAX_H3_FPS
-        if not MINIMAX_H3_MIN_DURATION <= duration <= MINIMAX_H3_MAX_DURATION:
+        floor = 0.0 if self.allow_short_clips else MINIMAX_H3_MIN_DURATION
+        if not floor <= duration <= MINIMAX_H3_MAX_DURATION:
             raise ValueError(
-                f"MiniMax-H3 generates between {MINIMAX_H3_MIN_DURATION} and {MINIMAX_H3_MAX_DURATION} seconds at "
+                f"MiniMax-H3 generates between {floor} and {MINIMAX_H3_MAX_DURATION} seconds at "
                 f"{MINIMAX_H3_FPS} fps, so `num_frames`, rounded up to the next `17 * n + 5` the video VAE can "
-                f"encode, must be between {int(MINIMAX_H3_MIN_DURATION * MINIMAX_H3_FPS)} and "
+                f"encode, must be between {int(floor * MINIMAX_H3_FPS)} and "
                 f"{int(MINIMAX_H3_MAX_DURATION * MINIMAX_H3_FPS)}, got {num_frames} (rounded up to {aligned})."
             )
         return aligned

@@ -92,8 +92,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--aspect_ratio", type=str, default=None,
                         help="W:H used for the auto canvas when no keyframe binds it (e.g. 16:9)")
     parser.add_argument("--video_length", type=int, default=124,
-                        help="frames @ 24 fps, snapped up to 17n+5; 5-15 s. 0 = derive from the single "
+                        help="frames @ 24 fps, snapped up to 17n+5; 4-30 s. 0 = derive from the single "
                              "audio-bearing reference (ref2va only)")
+    parser.add_argument("--allow_short", action="store_true",
+                        help="lift the 4 s floor so the VAE minimum of 5 frames can be requested (image mode); "
+                             "the 30 s ceiling and the 17n+5 grid still apply")
     parser.add_argument("--infer_steps", type=int, default=50,
                         help="sigma grid points, terminal 0 included (model evaluations = steps - 1)")
     parser.add_argument("--flow_shift", type=float, default=None, help="video sigma shift (checkpoint: 12.0)")
@@ -192,7 +195,9 @@ def parse_args() -> argparse.Namespace:
 
     # Output
     parser.add_argument("--save_path", type=str, required=True)
-    parser.add_argument("--output_type", type=str, default="video", choices=["video", "latent", "both"])
+    parser.add_argument("--output_type", type=str, default="video", choices=["video", "latent", "both", "images"],
+                        help="images: write the decoded frames as numbered PNGs instead of an mp4, and skip the "
+                             "audio decode entirely")
     parser.add_argument("--output_filename", type=str, default=None, help="explicit output file path (queue)")
     parser.add_argument("--latent_path", type=str, default=None,
                         help="decode-only: a *_latent.safetensors with 'latent' and 'audio_latent' keys")
@@ -271,6 +276,7 @@ def build_pipeline_shell(args, device):
         scheduler=scheduler,
         audio_scheduler=audio_scheduler,
         device=device,
+        allow_short_clips=args.allow_short,
         **geometry,
     )
 
@@ -618,9 +624,25 @@ def output_base(args, task: str, seed: int, index: int) -> str:
     return os.path.join(args.save_path, f"minimax_{task}_{stamp}_{seed}")
 
 
+def save_frames_png(frames: np.ndarray, base: str, metadata: dict | None) -> list:
+    """Write uint8 `[T, H, W, C]` frames as `base_0000.png`..., metadata in a `comment` tEXt chunk."""
+    from PIL.PngImagePlugin import PngInfo
+
+    info = None
+    if metadata:
+        info = PngInfo()
+        info.add_text("comment", json.dumps(metadata))
+    paths = []
+    for index, frame in enumerate(frames):
+        path = f"{base}_{index:04d}.png"
+        Image.fromarray(frame).save(path, pnginfo=info)
+        paths.append(path)
+    return paths
+
+
 def save_output(args, task, seed, plan, video_latents, audio_latents, frames, waveform, sample_rate, index=0):
-    """Write latents and/or the muxed video+audio mp4. `frames`/`waveform` may be None in
-    latent-only mode."""
+    """Write latents and/or the muxed video+audio mp4 (or PNG stills under --output_type images).
+    `frames`/`waveform` may be None in latent-only mode."""
     base = output_base(args, task, seed, index)
     metadata = None if args.no_metadata else build_metadata(args, task, seed, plan)
     saved = []
@@ -636,6 +658,11 @@ def save_output(args, task, seed, plan, video_latents, audio_latents, frames, wa
             metadata=metadata,
         )
         saved.append(latent_path)
+
+    if args.output_type == "images" and frames is not None:
+        paths = save_frames_png(frames, base, metadata)
+        saved.extend(paths)
+        print(f"Images saved to: {paths[0]} ({len(paths)} frames)", flush=True)
 
     if args.output_type in ("video", "both") and frames is not None:
         video_path = base + ".mp4"
@@ -834,13 +861,15 @@ def run_one(args, task, device, seed, extra_references=None, motion_context=None
     audio_latent_tensor = pipe.unpack_audio_latents(audio_latents, plan, layout)
 
     frames = waveform = sample_rate = None
-    if args.output_type in ("video", "both"):
+    if args.output_type in ("video", "both", "images"):
         vae.to(device)
-        audio_vae.to(device)
         frames = pipe.decode_video(video_latents.to(device))
-        waveform, sample_rate = pipe.decode_audio(audio_latent_tensor.to(device))
         vae.to("cpu")
-        audio_vae.to("cpu")
+        # Stills carry no soundtrack, so the audio VAE never has to reach the device.
+        if args.output_type != "images":
+            audio_vae.to(device)
+            waveform, sample_rate = pipe.decode_audio(audio_latent_tensor.to(device))
+            audio_vae.to("cpu")
         clean_memory_on_device(device)
 
     return plan, video_latents, audio_latent_tensor, frames, waveform, sample_rate, stopped_early
@@ -1135,6 +1164,8 @@ def main():
 
     start = time.time()
     if args.chain_count > 1 or args.chain_extend:
+        if args.output_type == "images":
+            raise ValueError("chaining joins video segments; --output_type images cannot be chained")
         run_chain(args, task, device)
         logger.info(f"done in {time.time() - start:.1f}s")
         return
