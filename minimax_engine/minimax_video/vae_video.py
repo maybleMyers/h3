@@ -848,6 +848,11 @@ class AutoencoderKLMiniMaxH3(AttentionMixin, ModelMixin, ConfigMixin, Autoencode
         num_tokens = z.shape[2] + token_drop
         pad_tokens = (-num_tokens) % tokens_chunk_size
         num_chunks = (num_tokens + pad_tokens) // tokens_chunk_size - int(token_drop > 0)
+        if num_chunks == 0:
+            # The whole video fits in the latents `token_drop` left of a single encoder chunk (5 frames
+            # -> 2 latents, the video VAE minimum). There is no following chunk to complete it, so those
+            # latents decode on their own: `temporal_ratio` pixel frames each, less the implicit lead pad.
+            return self._decode_clip(z)[:, :, self.frame_pre_padding :]
         if pad_tokens > 0:
             z = torch.cat([z, z[:, :, -1:].repeat(1, 1, pad_tokens, 1, 1)], dim=2)
 

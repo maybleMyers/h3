@@ -1756,18 +1756,18 @@ with gr.Blocks(
                         value="auto",
                         info="auto: any reference → ref2va, any keyframe → fl2va, else t2va",
                     )
-                    gr.Markdown("### Keyframes (fl2va)")
-                    with gr.Row():
-                        minimax_input_image = gr.Image(
-                            label="First Frame",
-                            type="filepath",
-                        )
-                        minimax_last_image = gr.Image(
-                            label="Last Frame",
-                            type="filepath",
-                        )
+                    with gr.Accordion("Keyframes (fl2va)", open=True) as minimax_keyframe_accordion:
+                        with gr.Row():
+                            minimax_input_image = gr.Image(
+                                label="First Frame",
+                                type="filepath",
+                            )
+                            minimax_last_image = gr.Image(
+                                label="Last Frame",
+                                type="filepath",
+                            )
 
-                    with gr.Accordion("References (ref2va)", open=False):
+                    with gr.Accordion("References (ref2va)", open=False) as minimax_reference_accordion:
                         gr.Markdown(
                             "Up to **9 images / 3 videos / 3 audio clips**, 12 total. New drops are "
                             "**added** to the set. The order is semantic (it labels the references and "
@@ -2646,6 +2646,17 @@ with gr.Blocks(
             inputs=minimax_template_vis_inputs,
             outputs=minimax_template_vis_outputs,
         )
+
+    def minimax_toggle_task_accordions(task_override):
+        """ref2va opens the reference set and folds the keyframes away; fl2va does the reverse."""
+        is_ref = task_override == "ref2va"
+        return gr.update(open=is_ref), gr.update(open=not is_ref, visible=not is_ref)
+
+    minimax_task_override.change(
+        fn=minimax_toggle_task_accordions,
+        inputs=[minimax_task_override],
+        outputs=[minimax_reference_accordion, minimax_keyframe_accordion],
+    )
 
     minimax_chain_enable.change(
         fn=lambda enabled: gr.update(visible=bool(enabled)),
