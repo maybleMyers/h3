@@ -114,6 +114,31 @@ def _is_fp32_key(key: str, curve: bool = False) -> bool:
     )
 
 
+def apply_dtype_policy(sd, dit_dtype, fp8, curve, exclude_keys, scaled=False):
+    """In-place dtype policy for a (partial) transformer state dict.
+
+    `scaled=True` is the fp8_scaled path, where quantization already ran and only the
+    float32 islands of the mixed-precision checkpoint still need promoting.
+    """
+    for k in list(sd.keys()):
+        if _is_fp32_key(k, curve):
+            if sd[k].dtype != torch.float32:
+                sd[k] = sd[k].to(torch.float32)
+        elif scaled:
+            continue
+        elif fp8 and (
+            k.endswith(".weight")
+            and any(t in k for t in FP8_TARGET_KEYS)
+            and not any(e in k for e in exclude_keys)
+            and sd[k].dtype in (torch.float16, torch.bfloat16, torch.float32)
+        ):
+            # plain e4m3 weight cast for eligible linear weights
+            sd[k] = sd[k].to(torch.float8_e4m3fn)
+        elif sd[k].dtype not in (torch.float8_e4m3fn,):
+            sd[k] = sd[k].to(dit_dtype)
+    return sd
+
+
 def _curve_overrides(files):
     """Config overrides for a curve-pruned checkpoint, or None for a full one.
 
@@ -372,9 +397,7 @@ def load_transformer(
                 exclude_layer_keys=exclude_keys,
                 move_to_device=False,
             )
-        for k in list(sd.keys()):
-            if _is_fp32_key(k, curve) and sd[k].dtype != torch.float32:
-                sd[k] = sd[k].to(torch.float32)
+        apply_dtype_policy(sd, dit_dtype, fp8, curve, exclude_keys, scaled=True)
         apply_fp8_monkey_patch(model, sd, use_scaled_mm=fp8_fast)
         info = model.load_state_dict(sd, strict=True, assign=True)
         logger.info(f"fp8-scaled transformer load ({subfolder}, curve_adaln={curve}): {info}")
@@ -389,25 +412,122 @@ def load_transformer(
             calc_device=device,
             move_to_device=False,
         )
-        for k in list(sd.keys()):
-            if _is_fp32_key(k, curve):
-                if sd[k].dtype != torch.float32:
-                    sd[k] = sd[k].to(torch.float32)
-            elif fp8 and (
-                k.endswith(".weight")
-                and any(t in k for t in FP8_TARGET_KEYS)
-                and not any(e in k for e in exclude_keys)
-                and sd[k].dtype in (torch.float16, torch.bfloat16, torch.float32)
-            ):
-                # plain e4m3 weight cast for eligible linear weights
-                sd[k] = sd[k].to(torch.float8_e4m3fn)
-            elif sd[k].dtype not in (torch.float8_e4m3fn,):
-                sd[k] = sd[k].to(dit_dtype)
+        apply_dtype_policy(sd, dit_dtype, fp8, curve, exclude_keys)
         info = model.load_state_dict(sd, strict=True, assign=True)
         logger.info(f"transformer load ({subfolder}, curve_adaln={curve}): {info}")
 
     model.eval().requires_grad_(False)
     return model
+
+
+def load_transformer_progressive(
+    ckpt_dir: str,
+    device: torch.device,
+    task: str = "t2va",
+    dit_dtype: torch.dtype = torch.bfloat16,
+    fp8: bool = False,
+    fp8_scaled: bool = False,
+    fp8_fast: bool = False,
+    fp8_exclude_adaln: bool = False,
+    lora_weights_list: Optional[List[dict]] = None,
+    lora_multipliers: Optional[List[float]] = None,
+    dit_path: Optional[str] = None,
+):
+    """Build the transformer with only its non-block weights, ready to denoise against a
+    background block loader.
+
+    Returns `(model, loader)`, or `None` when the checkpoint needs the batch path (int8 /
+    upstream-named single-file exports, whose conversion is whole-file). The caller starts the
+    loader after wiring block swap; `transformer_blocks` stays on meta until it does.
+    """
+    from .progressive_load import ProgressiveTransformerLoader, split_block_keys
+    from .transformer import MiniMaxH3Transformer3DModel
+    from utils.safetensors_utils import safetensors_key_index, stream_safetensors
+
+    subfolder = "transformer_ref" if task == "ref2va" else "transformer"
+    tdir = dit_path if dit_path else _component_dir(ckpt_dir, subfolder)
+    if os.path.isdir(tdir):
+        config_path = os.path.join(tdir, "config.json")
+        if not os.path.exists(config_path):
+            config_path = os.path.join(_component_dir(ckpt_dir, subfolder), "config.json")
+        files = _shard_files(tdir)
+    else:
+        config_path = os.path.join(_component_dir(ckpt_dir, subfolder), "config.json")
+        files = [tdir]
+
+    from .int8_quant import is_int8_checkpoint, read_safetensors_header
+
+    single_file = bool(dit_path) and not os.path.isdir(dit_path) and str(dit_path).endswith(".safetensors")
+    diffusers_layout = single_file and "transformer_blocks.0.attn.to_q.weight" in read_safetensors_header(dit_path)
+    if single_file and not diffusers_layout and is_int8_checkpoint(dit_path):
+        return None
+
+    curve_overrides = _curve_overrides(files)
+    curve = curve_overrides is not None
+    if curve and fp8_exclude_adaln:
+        logger.warning("curve-pruned checkpoint: fp8_exclude_adaln is redundant, AdaLN is never fp8 here")
+    exclude_keys = FP8_EXCLUDE_KEYS + (["adaln_proj"] if (fp8_exclude_adaln or curve) else [])
+    model = _from_config(MiniMaxH3Transformer3DModel, config_path, dit_dtype, overrides=curve_overrides)
+    model.eval().requires_grad_(False)
+
+    lora_hook = report_unused = None
+    if lora_weights_list:
+        from utils.lora_utils import make_lora_weight_hook
+
+        expected_shapes = {k: tuple(v.shape) for k, v in model.state_dict().items()}
+        lora_weights_list = [convert_peft_lora_to_native(sd, expected_shapes) for sd in lora_weights_list]
+        lora_hook, report_unused = make_lora_weight_hook(lora_weights_list, lora_multipliers, device)
+
+    key_to_file = safetensors_key_index(files)
+    num_blocks = len(model.transformer_blocks)
+    non_block_keys, per_block_keys = split_block_keys(key_to_file.keys(), num_blocks)
+
+    # Phase 0: everything the forward touches outside the block stack — the patch projections,
+    # the timestep embedder, the token refiner and the output heads. Small, and loaded eagerly.
+    sd = {}
+    for path in files:
+        keys = [k for k in non_block_keys if key_to_file[k] == path]
+        if not keys:
+            continue
+        for key, value in stream_safetensors(path, keys=keys):
+            if lora_hook is not None:
+                value = lora_hook(key, value)
+            sd[key] = value
+    # FP8_TARGET_KEYS covers the block stack only, so nothing here quantizes either way
+    apply_dtype_policy(sd, dit_dtype, fp8, curve, exclude_keys, scaled=fp8_scaled)
+    info = model.load_state_dict(sd, strict=False, assign=True)
+    stranded = [k for k in info.missing_keys if not k.startswith("transformer_blocks.")]
+    if stranded or info.unexpected_keys:
+        raise RuntimeError(
+            f"progressive load: non-block weights incomplete "
+            f"(missing {stranded[:5]}, unexpected {list(info.unexpected_keys)[:5]})"
+        )
+
+    reads = []
+    for i in range(num_blocks):
+        by_file = {}
+        for key in per_block_keys[i]:
+            by_file.setdefault(key_to_file[key], []).append(key)
+        reads.append(list(by_file.items()))
+
+    loader = ProgressiveTransformerLoader(
+        model,
+        reads,
+        device=device,
+        dit_dtype=dit_dtype,
+        fp8=fp8,
+        fp8_scaled=fp8_scaled,
+        fp8_fast=fp8_fast,
+        curve=curve,
+        exclude_keys=exclude_keys,
+        lora_hook=lora_hook,
+        report_unused=report_unused,
+    )
+    logger.info(
+        f"progressive load: {subfolder} non-block weights ready (curve_adaln={curve}), "
+        f"{num_blocks} blocks will stream in behind the denoise loop"
+    )
+    return model, loader
 
 
 def _merge_loras_into_int8_sd(

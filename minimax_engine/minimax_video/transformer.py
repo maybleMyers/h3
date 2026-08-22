@@ -629,6 +629,9 @@ class MiniMaxH3Transformer3DModel(AttentionMixin, ModelMixin, ConfigMixin):
         # H1111 block swap state (modules/custom_offloading_utils.ModelOffloader).
         self.blocks_to_swap = None
         self.offloader = None
+        # Progressive load gate (minimax_video/progressive_load.BlockLoadGate), set while the
+        # block stack is still streaming in behind the denoise loop.
+        self.block_gate = None
 
     # -------------------------------------------------------------------------
     # H1111 block swap (mirrors cosmos_engine/cosmos_video/transformer.py).
@@ -673,21 +676,36 @@ class MiniMaxH3Transformer3DModel(AttentionMixin, ModelMixin, ConfigMixin):
             f"{self.num_blocks} blocks. Supports backward: {supports_backward}"
         )
 
-    def move_to_device_except_swap_blocks(self, device: torch.device):
+    def move_to_device_except_swap_blocks(self, device: torch.device, force: bool = False):
         # assume model is on cpu. do not move blocks to device to reduce temporary memory usage
-        if self.blocks_to_swap:
+        # `force` also holds the blocks back when block swap is off — a progressive load still has
+        # them on meta at this point and places each one itself as it lands.
+        skip_blocks = bool(self.blocks_to_swap) or force
+        if skip_blocks:
             save_blocks = self.transformer_blocks
             self.transformer_blocks = None
 
         self.to(device)
 
-        if self.blocks_to_swap:
+        if skip_blocks:
             self.transformer_blocks = save_blocks
 
     def prepare_block_swap_before_forward(self):
         if self.blocks_to_swap is None or self.blocks_to_swap == 0:
             return
         self.offloader.prepare_block_devices_before_forward(self.transformer_blocks)
+
+    def prepare_block_swap_scaffold(self):
+        """Weight-independent half of block swap setup, for a progressive load."""
+        if self.blocks_to_swap is None or self.blocks_to_swap == 0:
+            return
+        self.offloader.prepare_scaffold(self.transformer_blocks)
+
+    def attach_block_gate(self, gate):
+        """Gate the block loop (and the offloader's prefetch) on a background loader."""
+        self.block_gate = gate
+        if self.offloader is not None:
+            self.offloader.attach_gate(gate)
 
     def forward(
         self,
@@ -790,6 +808,9 @@ class MiniMaxH3Transformer3DModel(AttentionMixin, ModelMixin, ConfigMixin):
                 begin_forward(self.transformer_blocks)
 
         for block_idx, block in enumerate(self.transformer_blocks):
+            if self.block_gate is not None:
+                # progressive load: block this step until this block's weights have landed
+                self.block_gate.wait(block_idx)
             if self.blocks_to_swap:
                 self.offloader.wait_for_block(block_idx)
 

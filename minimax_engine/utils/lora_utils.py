@@ -71,81 +71,25 @@ def filter_lora_state_dict(
     return weights_sd
 
 
-def load_safetensors_with_lora_and_fp8(
-    model_files: Union[str, List[str]],
-    lora_weights_list: Optional[List[Dict[str, torch.Tensor]]],
+def make_lora_weight_hook(
+    lora_weights_list: List[Dict[str, torch.Tensor]],
     lora_multipliers: Optional[List[float]],
-    fp8_optimization: bool,
     calc_device: torch.device,
     move_to_device: bool = False,
-    target_keys: Optional[List[str]] = None,
-    exclude_keys: Optional[List[str]] = None,
-) -> dict[str, torch.Tensor]:
+):
+    """Build the `(model_key, tensor) -> tensor` LoRA merge hook used during a streaming load.
+
+    Returns `(hook, report_unused)`. `report_unused()` warns about LoRA tensors that never
+    matched a model weight and should be called once the whole checkpoint has streamed past.
+
+    The hook is *single-consumer*: a matched LoRA tensor is dropped from the tracking set so it
+    merges exactly once. Do not share one hook across threads or across two passes.
     """
-    Merge LoRA weights into the state dict of a model with fp8 optimization if needed.
-    This function loads model weights and merges LoRA weights on-the-fly to save memory.
+    list_of_lora_weight_keys = [set(lora_sd.keys()) for lora_sd in lora_weights_list]
 
-    Args:
-        model_files: Path to the model file or list of paths
-        lora_weights_list: List of LoRA weight dictionaries to merge
-        lora_multipliers: List of multipliers for LoRA weights
-        fp8_optimization: Whether to apply FP8 optimization (not used in this version)
-        calc_device: Device to perform calculations on
-        move_to_device: Whether to move tensors to the calculation device after loading
-        target_keys: Keys to target for optimization (not used in this version)
-        exclude_keys: Keys to exclude from optimization (not used in this version)
-        
-    Returns:
-        Merged state dictionary
-    """
-    # Ensure model_files is a list
-    if isinstance(model_files, str):
-        model_files = [model_files]
-
-    # Handle file patterns like "00001-of-00004"
-    extended_model_files = []
-    for model_file in model_files:
-        basename = os.path.basename(model_file)
-        match = re.match(r"^(.*?)(\d+)-of-(\d+)\.safetensors$", basename)
-        if match:
-            prefix = basename[: match.start(2)]
-            count = int(match.group(3))
-            for i in range(count):
-                filename = f"{prefix}{i+1:05d}-of-{count:05d}.safetensors"
-                filepath = os.path.join(os.path.dirname(model_file), filename)
-                if os.path.exists(filepath):
-                    extended_model_files.append(filepath)
-                else:
-                    raise FileNotFoundError(f"File {filepath} not found")
-        else:
-            extended_model_files.append(model_file)
-
-    # Deduplicate while preserving order: when a caller passes every shard of a
-    # sharded checkpoint, the pattern expansion above would otherwise repeat the
-    # full shard set once per input file (N^2 loads).
-    model_files = list(dict.fromkeys(extended_model_files))
-    logger.info(f"Loading model files: {model_files}")
-
-    # Prepare LoRA weights
-    if lora_weights_list is None or len(lora_weights_list) == 0:
-        # No LoRA weights, just load the model normally
-        state_dict = {}
-        for model_file in model_files:
-            for key, value in tqdm(stream_safetensors(model_file), **_load_progress(model_file)):
-                if move_to_device:
-                    value = value.to(calc_device)
-                state_dict[key] = value
-        return state_dict
-
-    # Prepare LoRA weight lookups for efficient access
-    list_of_lora_weight_keys = []
-    for lora_sd in lora_weights_list:
-        lora_weight_keys = set(lora_sd.keys())
-        list_of_lora_weight_keys.append(lora_weight_keys)
-
-    # Prepare multipliers
     if lora_multipliers is None:
         lora_multipliers = [1.0] * len(lora_weights_list)
+    lora_multipliers = list(lora_multipliers)
     while len(lora_multipliers) < len(lora_weights_list):
         lora_multipliers.append(1.0)
     if len(lora_multipliers) > len(lora_weights_list):
@@ -366,6 +310,88 @@ def load_safetensors_with_lora_and_fp8(
         if not move_to_device:
             model_weight = model_weight.to(original_device)
         return model_weight
+
+    def report_unused():
+        for i, lora_weight_keys in enumerate(list_of_lora_weight_keys):
+            if len(lora_weight_keys) > 0:
+                # Filter out non-weight keys (like alpha, diff, etc.)
+                unused_weight_keys = [k for k in lora_weight_keys if k.endswith(('.weight', '.alpha', '.diff', '.diff_b'))]
+                if unused_weight_keys:
+                    logger.warning(f"Warning: {len(unused_weight_keys)} LoRA keys were not used from set {i}: {', '.join(list(unused_weight_keys)[:5])}...")
+
+    return weight_hook_func, report_unused
+
+
+def load_safetensors_with_lora_and_fp8(
+    model_files: Union[str, List[str]],
+    lora_weights_list: Optional[List[Dict[str, torch.Tensor]]],
+    lora_multipliers: Optional[List[float]],
+    fp8_optimization: bool,
+    calc_device: torch.device,
+    move_to_device: bool = False,
+    target_keys: Optional[List[str]] = None,
+    exclude_keys: Optional[List[str]] = None,
+) -> dict[str, torch.Tensor]:
+    """
+    Merge LoRA weights into the state dict of a model with fp8 optimization if needed.
+    This function loads model weights and merges LoRA weights on-the-fly to save memory.
+
+    Args:
+        model_files: Path to the model file or list of paths
+        lora_weights_list: List of LoRA weight dictionaries to merge
+        lora_multipliers: List of multipliers for LoRA weights
+        fp8_optimization: Whether to apply FP8 optimization (not used in this version)
+        calc_device: Device to perform calculations on
+        move_to_device: Whether to move tensors to the calculation device after loading
+        target_keys: Keys to target for optimization (not used in this version)
+        exclude_keys: Keys to exclude from optimization (not used in this version)
+        
+    Returns:
+        Merged state dictionary
+    """
+    # Ensure model_files is a list
+    if isinstance(model_files, str):
+        model_files = [model_files]
+
+    # Handle file patterns like "00001-of-00004"
+    extended_model_files = []
+    for model_file in model_files:
+        basename = os.path.basename(model_file)
+        match = re.match(r"^(.*?)(\d+)-of-(\d+)\.safetensors$", basename)
+        if match:
+            prefix = basename[: match.start(2)]
+            count = int(match.group(3))
+            for i in range(count):
+                filename = f"{prefix}{i+1:05d}-of-{count:05d}.safetensors"
+                filepath = os.path.join(os.path.dirname(model_file), filename)
+                if os.path.exists(filepath):
+                    extended_model_files.append(filepath)
+                else:
+                    raise FileNotFoundError(f"File {filepath} not found")
+        else:
+            extended_model_files.append(model_file)
+
+    # Deduplicate while preserving order: when a caller passes every shard of a
+    # sharded checkpoint, the pattern expansion above would otherwise repeat the
+    # full shard set once per input file (N^2 loads).
+    model_files = list(dict.fromkeys(extended_model_files))
+    logger.info(f"Loading model files: {model_files}")
+
+    # Prepare LoRA weights
+    if lora_weights_list is None or len(lora_weights_list) == 0:
+        # No LoRA weights, just load the model normally
+        state_dict = {}
+        for model_file in model_files:
+            for key, value in tqdm(stream_safetensors(model_file), **_load_progress(model_file)):
+                if move_to_device:
+                    value = value.to(calc_device)
+                state_dict[key] = value
+        return state_dict
+
+    weight_hook_func, report_unused = make_lora_weight_hook(
+        lora_weights_list, lora_multipliers, calc_device, move_to_device=move_to_device
+    )
+
     # Load model with LoRA merging hook
     state_dict = {}
     for model_file in model_files:
@@ -376,12 +402,5 @@ def load_safetensors_with_lora_and_fp8(
                 value = value.to(calc_device)
             state_dict[key] = value
 
-    # Check for unused LoRA keys
-    for i, lora_weight_keys in enumerate(list_of_lora_weight_keys):
-        if len(lora_weight_keys) > 0:
-            # Filter out non-weight keys (like alpha, diff, etc.)
-            unused_weight_keys = [k for k in lora_weight_keys if k.endswith(('.weight', '.alpha', '.diff', '.diff_b'))]
-            if unused_weight_keys:
-                logger.warning(f"Warning: {len(unused_weight_keys)} LoRA keys were not used from set {i}: {', '.join(list(unused_weight_keys)[:5])}...")
-
+    report_unused()
     return state_dict

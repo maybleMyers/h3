@@ -188,7 +188,15 @@ def optimize_state_dict_with_fp8_on_the_fly(
 
 
 def optimize_state_dict_with_fp8(
-    state_dict, calc_device, target_layer_keys=None, exclude_layer_keys=None, exp_bits=4, mantissa_bits=3, move_to_device=False
+    state_dict,
+    calc_device,
+    target_layer_keys=None,
+    exclude_layer_keys=None,
+    exp_bits=4,
+    mantissa_bits=3,
+    move_to_device=False,
+    quiet=False,
+    cleanup_every=1,
 ):
     """
     Optimize Linear layer weights in a model's state dict to FP8 format.
@@ -230,8 +238,9 @@ def optimize_state_dict_with_fp8(
         if is_target and isinstance(state_dict[key], torch.Tensor):
             target_state_dict_keys.append(key)
 
-    # Process each key
-    for key in tqdm(target_state_dict_keys):
+    # Process each key. `quiet`/`cleanup_every` let a per-block caller (progressive load) reuse
+    # this without one tqdm bar, log line and gc.collect() per layer.
+    for key in target_state_dict_keys if quiet else tqdm(target_state_dict_keys):
         value = state_dict[key]
 
         # Save original device and dtype
@@ -265,11 +274,12 @@ def optimize_state_dict_with_fp8(
 
         optimized_count += 1
 
-        if calc_device is not None:  # optimized_count % 10 == 0 and
+        if calc_device is not None and optimized_count % cleanup_every == 0:
             # free memory on calculation device
             clean_memory_on_device(calc_device)
 
-    logger.info(f"Number of optimized Linear layers: {optimized_count}")
+    if not quiet:
+        logger.info(f"Number of optimized Linear layers: {optimized_count}")
     return state_dict
 
 
@@ -341,7 +351,7 @@ def fp8_linear_forward_patch(self: nn.Linear, x, use_scaled_mm=False, max_value=
         return output
 
 
-def apply_fp8_monkey_patch(model, optimized_state_dict, use_scaled_mm=False):
+def apply_fp8_monkey_patch(model, optimized_state_dict, use_scaled_mm=False, quiet=False):
     """
     Apply monkey patching to a model using FP8 optimized state dict.
 
@@ -412,9 +422,10 @@ def apply_fp8_monkey_patch(model, optimized_state_dict, use_scaled_mm=False):
             module.register_buffer("scale_input", torch.tensor(1.0, dtype=torch.float32))
             scale_input_count += 1
 
-    logger.info(f"Number of monkey-patched Linear layers: {patched_count}")
-    if scale_input_count > 0:
-        logger.info(f"Number of layers with scale_input registered: {scale_input_count}")
+    if not quiet:
+        logger.info(f"Number of monkey-patched Linear layers: {patched_count}")
+        if scale_input_count > 0:
+            logger.info(f"Number of layers with scale_input registered: {scale_input_count}")
     return model
 
 

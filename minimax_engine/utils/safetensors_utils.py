@@ -197,17 +197,36 @@ def safetensors_key_count(path: str) -> int:
         return len(f.keys())
 
 
+def safetensors_key_index(paths) -> Dict[str, str]:
+    """Map tensor key -> containing shard path, reading only the shard headers.
+
+    Deliberately independent of `*.index.json`: `--dit` may name a bare directory of shards or a
+    single merged file, neither of which is guaranteed to ship an index.
+    """
+    if isinstance(paths, str):
+        paths = [paths]
+    index = {}
+    for path in paths:
+        with MemoryEfficientSafeOpen(path) as f:
+            for key in f.keys():
+                index[key] = path
+    return index
+
+
 def stream_safetensors(
     path: str,
     num_threads: Optional[int] = None,
     read_ahead: Optional[int] = None,
     drop_page_cache: Optional[bool] = None,
+    keys: Optional[list] = None,
 ):
     """Yield (key, tensor) in file order, reading with a thread pool (os.preadv, QD ~num_threads).
 
     drop_page_cache (default: on for files >= 1 GB, override $H3_LOAD_DROP_CACHE=0/1) evicts
     each tensor's range from the kernel page cache after reading, so a model-sized file does
     not double apparent RAM use during load. num_threads defaults to $H3_LOAD_THREADS or 8.
+
+    `keys` restricts the read to a subset, re-sorted into file order so the reads stay sequential.
     """
     if num_threads is None:
         num_threads = _default_read_threads()
@@ -215,7 +234,13 @@ def stream_safetensors(
         drop_page_cache = _should_drop_page_cache(path)
     drop_page_cache = drop_page_cache and hasattr(os, "posix_fadvise")
     with MemoryEfficientSafeOpen(path) as f:
-        keys = f.keys()
+        if keys is None:
+            keys = f.keys()
+        else:
+            missing = [k for k in keys if k not in f.header]
+            if missing:
+                raise KeyError(f"{path} has no tensor '{missing[0]}' ({len(missing)} keys missing)")
+            keys = sorted(keys, key=lambda k: f.header[k]["data_offsets"][0])
         data_start = f.header_size + 8
         if num_threads <= 1 or not hasattr(os, "preadv"):
             seq_fd = f.file.fileno()

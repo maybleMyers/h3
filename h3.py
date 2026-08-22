@@ -571,6 +571,7 @@ def minimax_submit_to_queue(
     sol_tau: float,
     blocks_to_swap: int,
     classic_block_swap: bool,
+    progressive_load: bool,
     offload_engine: str,
     mm_strategy: str,
     act_chunk_rows,
@@ -841,6 +842,8 @@ def minimax_submit_to_queue(
             command.append("--int8_fast")
         if classic_block_swap:
             command.append("--classic_block_swap")
+        if progressive_load:
+            command.append("--progressive_load")
         if offload_engine == "diffusers-mm":
             command.extend(["--offload_engine", "diffusers_mm", "--mm_strategy", str(mm_strategy)])
         else:
@@ -900,6 +903,7 @@ def minimax_submit_to_queue(
             "attn_mode": attn_mode,
             "sol_tau": sol_tau,
             "blocks_to_swap": blocks_to_swap,
+            "progressive_load": progressive_load,
             "compile": compile_enabled,
             "save_path": save_path,
         }
@@ -1991,6 +1995,11 @@ with gr.Blocks(
                         info="legacy rolling swap instead of pinned sub-block weight streaming "
                              "(streaming pins ~1.2 GB/block bf16 or ~0.6 GB/block fp8 of host RAM)",
                     )
+                    minimax_progressive_load = gr.Checkbox(
+                        label="Progressive Load", value=False,
+                        info="start denoising as soon as the non-block weights are ready and load the block "
+                             "stack in the background; step 1 waits per block (not for diffusers-mm or int8)",
+                    )
                     minimax_act_chunk_rows = gr.Number(
                         label="Activation Chunk Rows (0 = off)", value=32768, step=1, minimum=0,
                         info="process row-wise ops (AdaLN, rotary, FF, output heads) in slices of this many "
@@ -2402,6 +2411,7 @@ with gr.Blocks(
             minimax_sol_tau,
             minimax_blocks_to_swap,
             minimax_classic_block_swap,
+            minimax_progressive_load,
             minimax_offload_engine,
             minimax_mm_strategy,
             minimax_act_chunk_rows,
@@ -2717,6 +2727,7 @@ with gr.Blocks(
         minimax_sol_tau,
         minimax_blocks_to_swap,
         minimax_classic_block_swap,
+        minimax_progressive_load,
         minimax_offload_engine,
         minimax_mm_strategy,
         minimax_act_chunk_rows,
@@ -2765,6 +2776,7 @@ with gr.Blocks(
         "minimax_sol_tau",
         "minimax_blocks_to_swap",
         "minimax_classic_block_swap",
+        "minimax_progressive_load",
         "minimax_offload_engine",
         "minimax_mm_strategy",
         "minimax_act_chunk_rows",
@@ -3032,6 +3044,7 @@ with gr.Blocks(
             attn_update,                                      # minimax_attn_mode
             opt("sol_tau", float),                            # minimax_sol_tau
             opt("blocks_to_swap", int),                       # minimax_blocks_to_swap
+            opt("progressive_load", bool),                    # minimax_progressive_load
             opt("compile", bool),                             # minimax_compile
             opt("save_path", str),                            # minimax_save_path
         ]
@@ -3076,7 +3089,8 @@ with gr.Blocks(
             minimax_width, minimax_height, minimax_video_length,
             minimax_infer_steps, minimax_flow_shift, minimax_audio_flow_shift,
             minimax_seed, minimax_num_outputs, minimax_ckpt_dir, minimax_attn_mode,
-            minimax_sol_tau, minimax_blocks_to_swap, minimax_compile, minimax_save_path,
+            minimax_sol_tau, minimax_blocks_to_swap, minimax_progressive_load,
+            minimax_compile, minimax_save_path,
         ],
     ).then(
         fn=change_to_minimax_tab,

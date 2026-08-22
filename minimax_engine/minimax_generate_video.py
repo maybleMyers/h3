@@ -156,6 +156,10 @@ def parse_args() -> argparse.Namespace:
                         help="0-49 transformer blocks kept on CPU (pinned) and streamed through the GPU")
     parser.add_argument("--classic_block_swap", action="store_true",
                         help="use the legacy rolling block swap instead of pinned sub-block weight streaming")
+    parser.add_argument("--progressive_load", action="store_true",
+                        help="start denoising as soon as the non-block DiT weights are ready and load the block "
+                             "stack in the background; step 1 waits per block. Not available with "
+                             "--offload_engine diffusers_mm or int8 single-file checkpoints")
     parser.add_argument("--offload_engine", choices=["blockswap", "diffusers_mm"], default="blockswap",
                         help="DiT offload backend: 'blockswap' (built-in) or 'diffusers_mm' (diffusers-mm package)")
     parser.add_argument("--mm_strategy", default="auto",
@@ -446,20 +450,46 @@ def load_transformer_stage(args, task, device):
 
     logger.info("Loading DiT weights...")
     start = time.time()
-    transformer = load_transformer(
-        args.ckpt_dir,
-        device=device,
-        task=task,
-        dit_dtype=str_to_dtype(args.dit_dtype),
-        fp8=args.fp8,
-        fp8_scaled=args.fp8_scaled,
-        fp8_fast=args.fp8_fast,
-        fp8_exclude_adaln=args.fp8_exclude_adaln,
-        lora_weights_list=lora_weights_list,
-        lora_multipliers=lora_multipliers,
-        dit_path=args.dit,
-        int8_use_int_mm=args.int8_fast,
-    )
+    progressive = None
+    if args.progressive_load:
+        if args.offload_engine == "diffusers_mm":
+            logger.warning("--progressive_load is not available with --offload_engine diffusers_mm; ignored")
+        else:
+            from minimax_video.model_loader import load_transformer_progressive
+
+            progressive = load_transformer_progressive(
+                args.ckpt_dir,
+                device=device,
+                task=task,
+                dit_dtype=str_to_dtype(args.dit_dtype),
+                fp8=args.fp8,
+                fp8_scaled=args.fp8_scaled,
+                fp8_fast=args.fp8_fast,
+                fp8_exclude_adaln=args.fp8_exclude_adaln,
+                lora_weights_list=lora_weights_list,
+                lora_multipliers=lora_multipliers,
+                dit_path=args.dit,
+            )
+            if progressive is None:
+                logger.info("int8 checkpoint: --progressive_load falls back to the batch load")
+    loader = None
+    if progressive is not None:
+        transformer, loader = progressive
+    else:
+        transformer = load_transformer(
+            args.ckpt_dir,
+            device=device,
+            task=task,
+            dit_dtype=str_to_dtype(args.dit_dtype),
+            fp8=args.fp8,
+            fp8_scaled=args.fp8_scaled,
+            fp8_fast=args.fp8_fast,
+            fp8_exclude_adaln=args.fp8_exclude_adaln,
+            lora_weights_list=lora_weights_list,
+            lora_multipliers=lora_multipliers,
+            dit_path=args.dit,
+            int8_use_int_mm=args.int8_fast,
+        )
     if args.attn_mode == "sol":
         from minimax_video.sol_attn import SOL_CTX, is_sol_available
 
@@ -492,11 +522,27 @@ def load_transformer_stage(args, task, device):
             args.blocks_to_swap, device, supports_backward=False, streaming=not args.classic_block_swap
         )
         transformer.move_to_device_except_swap_blocks(device)
-        transformer.prepare_block_swap_before_forward()
+        if loader is not None:
+            transformer.prepare_block_swap_scaffold()
+        else:
+            transformer.prepare_block_swap_before_forward()
+    elif loader is not None:
+        # blocks are still on meta; the loader places each one as it lands
+        transformer.move_to_device_except_swap_blocks(device, force=True)
     else:
         transformer.to(device)
+
+    if loader is not None:
+        transformer.attach_block_gate(loader.gate)
+        loader.start()
+        logger.info(
+            f"progressive load: denoise starts now, {len(transformer.transformer_blocks)} blocks "
+            f"streaming in background (setup {time.time() - start:.1f}s)"
+        )
+        return transformer, loader
+
     logger.info(f"transformer loaded in {time.time() - start:.1f}s")
-    return transformer
+    return transformer, None
 
 
 def make_step_callback(args, pipe, plan, layout, progress_bar, previewer_holder):
@@ -787,7 +833,7 @@ def run_one(args, task, device, seed, extra_references=None, motion_context=None
     clean_memory_on_device(device)
 
     # Stage C: transformer -> denoise.
-    transformer = load_transformer_stage(args, plan.task, device)
+    transformer, block_loader = load_transformer_stage(args, plan.task, device)
     pipe.transformer = transformer
     pipe.patch_size = tuple(transformer.config.patch_size)
 
@@ -824,6 +870,17 @@ def run_one(args, task, device, seed, extra_references=None, motion_context=None
         logger.info("stop requested: decoding the current state")
     finally:
         progress_bar.close()
+        if block_loader is not None:
+            # join before any teardown touches the block stack
+            block_loader.close()
+            gate = block_loader.gate
+            logger.info(
+                f"progressive load: denoise stalled {gate.stall_seconds:.1f}s "
+                f"on {gate.stalled_blocks} blocks"
+            )
+            transformer.block_gate = None
+            if transformer.offloader is not None:
+                transformer.offloader.attach_gate(None)
 
     if args.attn_mode == "sol":
         from minimax_video.sol_attn import SOL_CTX
@@ -849,6 +906,10 @@ def run_one(args, task, device, seed, extra_references=None, motion_context=None
         mm = None
     else:
         release_host_cache = None
+    if transformer.offloader is not None:
+        remove_hooks = getattr(transformer.offloader, "remove_hooks", None)
+        if remove_hooks is not None:
+            remove_hooks()  # the chunk pre-hooks otherwise outlive the module across a chained batch
     del transformer
     pipe.transformer = None
     gc.collect()  # int8/fp8-patched modules sit in reference cycles; free them before the VAEs return
