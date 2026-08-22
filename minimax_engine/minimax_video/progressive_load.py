@@ -122,6 +122,17 @@ class ProgressiveTransformerLoader:
         if thread.is_alive():
             logger.warning("progressive load: loader thread did not stop within %.0fs", timeout)
 
+    def release(self):
+        """Drop every reference the loader holds so the caller's `del transformer` actually frees it.
+
+        `self.model` alone keeps the whole DiT — resident blocks, staging ring and pinned masters —
+        alive for as long as the loader object is in scope, which is past the VAE decode.
+        """
+        self.model = None
+        self.reads = None
+        self.lora_hook = None
+        self.report_unused = None
+
     # ----- loader thread -----
 
     def _run(self):

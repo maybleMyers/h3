@@ -881,6 +881,10 @@ def run_one(args, task, device, seed, extra_references=None, motion_context=None
             transformer.block_gate = None
             if transformer.offloader is not None:
                 transformer.offloader.attach_gate(None)
+            # the loader holds the transformer; without this the `del transformer` below frees
+            # nothing and the DiT stays resident right through the VAE decode
+            block_loader.release()
+            block_loader = None
 
     if args.attn_mode == "sol":
         from minimax_video.sol_attn import SOL_CTX
