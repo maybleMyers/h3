@@ -52,7 +52,7 @@ if "--compile" in sys.argv:
     _compile_config.USE_TORCH_COMPILE = True
     print("torch.compile() enabled for optimized inference (function-level compilation)")
 
-from utils.device_utils import clean_memory_on_device
+from utils.device_utils import clean_memory_on_device, synchronize_device
 from utils.model_utils import str_to_dtype
 from utils.safetensors_utils import load_safetensors, mem_eff_save_file
 
@@ -911,23 +911,38 @@ def run_one(args, task, device, seed, extra_references=None, motion_context=None
     else:
         release_host_cache = None
     if transformer.offloader is not None:
-        remove_hooks = getattr(transformer.offloader, "remove_hooks", None)
-        if remove_hooks is not None:
-            remove_hooks()  # the chunk pre-hooks otherwise outlive the module across a chained batch
+        # the streaming offloader owns a multi-GB staging ring that no amount of gc gets back;
+        # `remove_hooks` alone (the rolling swapper's whole surface) leaves it on the device
+        release = getattr(transformer.offloader, "release", None)
+        if release is not None:
+            release()
+        else:
+            remove_hooks = getattr(transformer.offloader, "remove_hooks", None)
+            if remove_hooks is not None:
+                remove_hooks()  # the chunk pre-hooks otherwise outlive the module across a chained batch
+
     del transformer
     pipe.transformer = None
     gc.collect()  # int8/fp8-patched modules sit in reference cycles; free them before the VAEs return
     if release_host_cache is not None:
         release_host_cache()  # gc does not return the group-offload pinned host pool
+    synchronize_device(device)  # staging buffers were allocated on the loader stream; empty_cache alone misses them
     clean_memory_on_device(device)
 
     # Stage D: VAEs back -> decode + save.
-    video_latents = pipe.unpack_video_latents(latents, plan, layout)
-    audio_latent_tensor = pipe.unpack_audio_latents(audio_latents, plan, layout)
+    video_latents = pipe.unpack_video_latents(latents, plan, layout).to("cpu")
+    audio_latent_tensor = pipe.unpack_audio_latents(audio_latents, plan, layout).to("cpu")
+    # the denoise-side device tensors are dead once the latents are unpacked, and `row_timestep_plan`
+    # alone is one live tuple of device tensors per step; none of it may sit through the decode
+    del latents, audio_latents, condition_latents, audio_condition_latents
+    del row_timestep_plan, timesteps, audio_timesteps
+    clean_memory_on_device(device)
 
     frames = waveform = sample_rate = None
     if args.output_type in ("video", "both", "images"):
-        vae.to(device)
+        # only the decode half goes back to the device: the encoder is another ~2 GB and Stage B is over
+        vae.decoder.to(device)
+        vae.post_quant_conv.to(device)
         frames = pipe.decode_video(video_latents.to(device))
         vae.to("cpu")
         # Stills carry no soundtrack, so the audio VAE never has to reach the device.

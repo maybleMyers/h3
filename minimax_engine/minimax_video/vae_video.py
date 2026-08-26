@@ -17,6 +17,7 @@
 # `attention` module and the missing `AutoencoderMixin` is replaced by a local shim.
 
 import math
+from collections.abc import Iterator
 
 import torch
 import torch.nn as nn
@@ -652,6 +653,18 @@ class AutoencoderKLMiniMaxH3(AttentionMixin, ModelMixin, ConfigMixin, Autoencode
         self.tile_sample_min_overlap_height = 64
         self.tile_sample_min_overlap_width = 64
 
+    def num_decoded_frames(self, num_latent_frames: int) -> int:
+        r"""
+        The number of pixel frames [`~_decode`] returns for `num_latent_frames` latent frames.
+
+        Every latent frame covers `temporal_compression_ratio` pixel frames except the first of each encoder chunk,
+        whose leading `frame_pre_padding` frames are the encoder's implicit pad and are dropped.
+        """
+        return (
+            num_latent_frames * self.temporal_compression_ratio
+            - self.frame_pre_padding * math.ceil(num_latent_frames / self.tokens_chunk_size)
+        )
+
     def enable_tiling(
         self,
         tile_sample_min_height: int | None = None,
@@ -832,18 +845,30 @@ class AutoencoderKLMiniMaxH3(AttentionMixin, ModelMixin, ConfigMixin, Autoencode
             moments = moments[:, :, : -self.config.token_drop]
         return moments
 
-    def _decode(self, z: torch.Tensor) -> torch.Tensor:
+    def iter_decode(self, z: torch.Tensor) -> Iterator[torch.Tensor]:
         r"""
-        Decode a latent video, mirroring the chunking that `_encode` applied.
+        Decode a latent video chunk by chunk, mirroring the chunking that `_encode` applied.
 
         `token_drop` removed the tail of every encoded chunk, so consecutive decoded chunks overlap by
         `frame_overlap` pixel frames and are linearly cross-faded. Latent frames are repeated at the end when the
-        length is not a whole number of chunks; the extra pixel frames are cut off again at the end.
+        length is not a whole number of chunks; the yielded chunks are capped so that they total
+        [`~num_decoded_frames`] pixel frames, which cuts those extra frames off again.
+
+        `torch.cat(list(self.iter_decode(z)), dim=2)` is [`~_decode`]. Decoding a long video through this method
+        instead keeps only one chunk of pixels on the device at a time; the caller is then free to move each chunk
+        to the host before the next one is decoded.
         """
+        remaining = self.num_decoded_frames(z.shape[2])
+        if remaining <= 0:
+            return
+        # `decode` carries the offload hook; a generator function would fire it before its body ever runs.
+        hook = getattr(self, "_hf_hook", None)
+        if hasattr(hook, "pre_forward"):
+            hook.pre_forward(self)
+
         tokens_chunk_size = self.tokens_chunk_size
         token_drop = self.config.token_drop
-        temporal_ratio = self.temporal_compression_ratio
-        chunk_num_frames = tokens_chunk_size * temporal_ratio
+        chunk_num_frames = tokens_chunk_size * self.temporal_compression_ratio
 
         num_tokens = z.shape[2] + token_drop
         pad_tokens = (-num_tokens) % tokens_chunk_size
@@ -852,11 +877,11 @@ class AutoencoderKLMiniMaxH3(AttentionMixin, ModelMixin, ConfigMixin, Autoencode
             # The whole video fits in the latents `token_drop` left of a single encoder chunk (5 frames
             # -> 2 latents, the video VAE minimum). There is no following chunk to complete it, so those
             # latents decode on their own: `temporal_ratio` pixel frames each, less the implicit lead pad.
-            return self._decode_clip(z)[:, :, self.frame_pre_padding :]
+            yield self._decode_clip(z)[:, :, self.frame_pre_padding :][:, :, :remaining]
+            return
         if pad_tokens > 0:
             z = torch.cat([z, z[:, :, -1:].repeat(1, 1, pad_tokens, 1, 1)], dim=2)
 
-        decoded_chunks = []
         overlap = None
         for i in range(num_chunks):
             start = i * tokens_chunk_size
@@ -868,25 +893,30 @@ class AutoencoderKLMiniMaxH3(AttentionMixin, ModelMixin, ConfigMixin, Autoencode
                 if j == 0:
                     if overlap is not None:
                         chunk = self._blend(overlap, chunk, self.frame_overlap, dim=-3)
-                    decoded_chunks.append(chunk)
+                        overlap = None  # release the previous clip before the next one is decoded
+                    if chunk.shape[2] >= remaining:
+                        yield chunk[:, :, :remaining]
+                        return
+                    remaining -= chunk.shape[2]
+                    yield chunk
                 else:
                     overlap = chunk
+            del clip
         if overlap is not None:
-            decoded_chunks.append(overlap)
+            yield overlap[:, :, :remaining]
 
-        dec = torch.cat(decoded_chunks, dim=2)
-
-        # `pad_tokens` repeated latent frames produced trailing pixel frames that were never requested. A chunk's
-        # last latent frame only covers `clip_length % temporal_ratio` pixel frames, the others cover `temporal_ratio`.
-        if pad_tokens > 0:
-            intra_tail = self.config.clip_length % temporal_ratio
-            num_tokens_before_pad = z.shape[2] - pad_tokens
-            pad_frames = sum(
-                intra_tail if intra_tail and (num_tokens_before_pad + k) % tokens_chunk_size == 0 else temporal_ratio
-                for k in range(pad_tokens)
-            )
-            dec = dec[:, :, :-pad_frames]
-        return dec
+    def _decode(self, z: torch.Tensor) -> torch.Tensor:
+        r"""Decode a latent video into one pixel tensor, assembled from the chunks of [`~iter_decode`]."""
+        decoded = None
+        cursor = 0
+        for chunk in self.iter_decode(z):
+            if decoded is None:
+                shape = list(chunk.shape)
+                shape[2] = self.num_decoded_frames(z.shape[2])
+                decoded = torch.empty(shape, dtype=chunk.dtype, device=chunk.device)
+            decoded[:, :, cursor : cursor + chunk.shape[2]].copy_(chunk)
+            cursor += chunk.shape[2]
+        return decoded
 
     @apply_forward_hook
     def encode(self, x: torch.Tensor, return_dict: bool = True) -> AutoencoderKLOutput | tuple[torch.Tensor]:

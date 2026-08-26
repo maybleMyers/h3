@@ -764,15 +764,37 @@ class MiniMaxH3Pipeline:
 
         The decode runs under float16 autocast over the float32 VAE weights — the PR's verified
         recipe — and the VAE emits ImageNet-normalized RGB that is reverted here.
+
+        The VAE decodes one temporal chunk at a time and every chunk is reduced to uint8 and moved
+        to the host before the next one is decoded, so the device never holds more than a chunk of
+        pixels: a long video costs no more device memory than a short one.
         """
         device = latents.device
-        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
-            video = self.vae.decode(latents, return_dict=False)[0]
         pixel_mean = torch.tensor(MINIMAX_H3_PIXEL_MEAN, device=device).view(1, -1, 1, 1, 1)
         pixel_std = torch.tensor(MINIMAX_H3_PIXEL_STD, device=device).view(1, -1, 1, 1, 1)
-        video = (video.float() * pixel_std + pixel_mean).clamp(0, 1)
-        frames = (video[0] * 255.0).round().to(torch.uint8)  # [C, T, H, W]
-        return frames.permute(1, 2, 3, 0).cpu().numpy()
+
+        total = self.vae.num_decoded_frames(latents.shape[2])
+        frames = None
+        cursor = 0
+        chunks = self.vae.iter_decode(latents)
+        while True:
+            # the generator body runs inside `next`, so the autocast context has to wrap that, not the loop
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
+                video = next(chunks, None)
+            if video is None:
+                break
+            video = (video.float() * pixel_std + pixel_mean).clamp(0, 1)
+            chunk = (video[0] * 255.0).round().to(torch.uint8)  # [C, t, H, W]
+            del video
+            block = chunk.permute(1, 2, 3, 0).contiguous().cpu().numpy()  # [t, H, W, C]
+            del chunk
+            if frames is None:
+                frames = np.empty((total, *block.shape[1:]), dtype=np.uint8)
+            frames[cursor : cursor + block.shape[0]] = block
+            cursor += block.shape[0]
+        if cursor != total:
+            raise RuntimeError(f"decoded {cursor} frames, expected {total}")
+        return frames
 
     @torch.no_grad()
     def decode_audio(self, audio_latents: torch.Tensor) -> tuple[torch.Tensor, int]:

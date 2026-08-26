@@ -286,6 +286,36 @@ def test_video_vae_tiny_encode_decode_shapes():
 
 
 @torch.no_grad()
+def test_video_vae_decode_streams_every_chunking():
+    """`iter_decode` is `decode` split at the chunk seams, for every latent length."""
+    from minimax_video.vae_video import AutoencoderKLMiniMaxH3
+
+    torch.manual_seed(0)
+    vae = AutoencoderKLMiniMaxH3(
+        block_out_channels=(32, 64),
+        layers_per_block=1,
+        spatial_downsample_factors=(2, 2),
+        temporal_downsample_factors=(2, 2),
+        decoder_num_layers=4,
+        decoder_num_attention_heads=4,
+        decoder_attention_head_dim=32,
+    ).eval()
+
+    # `pad_frames` reaches 13 at num_latent_frames % 5 == 3, well past the 5-frame tail chunk, so
+    # the tail truncation has to run back into the chunk before it. Cover every residue.
+    for num_latent_frames in range(1, 25):
+        z = torch.randn(1, vae.config.latent_channels, num_latent_frames, 8, 8)
+        decoded = vae.decode(z).sample
+        assert decoded.shape[2] == vae.num_decoded_frames(num_latent_frames), num_latent_frames
+        streamed = torch.cat(list(vae.iter_decode(z)), dim=2)
+        assert torch.equal(streamed, decoded), num_latent_frames
+
+    # The released geometry: 17n + 5 pixel frames out of 5n + 2 latents.
+    for n in range(4):
+        assert vae.num_decoded_frames(5 * n + 2) == 17 * n + 5
+
+
+@torch.no_grad()
 def test_audio_vae_tiny_encode_decode_shapes():
     from minimax_video.vae_audio import AutoencoderKLMiniMaxH3Audio
 

@@ -821,6 +821,27 @@ class ChunkedStreamingOffloader:
             handle.remove()
         self._hook_handles = []
 
+    def release(self):
+        """Drop every GPU allocation this offloader owns. The block stack is unusable afterwards.
+
+        Garbage collecting the transformer would get there eventually, but the staging ring is
+        allocated on `copy_stream`, so it only comes back to the allocator after a synchronize —
+        and until it does it is GBs of device memory standing in the VAE decode's way.
+        """
+        self.remove_hooks()
+        self.reset()
+        synchronize_device(self.device)
+        self.staging = None
+        self.set_release_evt = None
+        self.chunk_params = {}
+        self.upload_evt = {}
+        self.pos_staging = {}
+        self.copy_stream = None
+        self._ring_bytes = 0
+        self._scaffolded = False
+        self._prepared = False
+        clean_memory_on_device(self.device)
+
     # ----- internals -----
 
     def _make_pre_hook(self, pos: int):
