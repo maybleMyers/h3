@@ -915,6 +915,12 @@ def minimax_submit_to_queue(
             parameters["last_image_path"] = last_image
         if references:
             parameters["references"] = references
+        if lora_weights_paths:
+            parameters["lora_folder"] = lora_folder
+            parameters["loras"] = [
+                {"name": os.path.basename(path), "strength": float(mult)}
+                for path, mult in zip(lora_weights_paths, lora_multipliers_values)
+            ]
         if chaining:
             parameters["chain_count"] = int(chain_count)
             parameters["chain_mode"] = chain_mode
