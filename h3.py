@@ -1,4 +1,4 @@
-# h3.py — standalone MiniMax-H3 GUI (MiniMax + Frame Interpolation + Video Info tabs)
+# h3.py — standalone MiniMax-H3 GUI (MiniMax + Video Info + Frame Interpolation + H3 Upscale tabs)
 # Assembled from H1111/h1111.py (branch h3 @ ece03a2); backend lives in minimax_engine/.
 import os
 
@@ -1460,6 +1460,122 @@ def upscale_video(
         traceback.print_exc()
 
 
+def _stream_open_h3_job(cmd: List[str]) -> Generator[Tuple[Optional[str], str, float], None, None]:
+    """Run the open_h3_regenerate.py driver and parse its PROGRESS/OUTPUT/ERROR protocol."""
+    last_status = "Starting..."
+    last_progress = 0.0
+    output_file = None
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        while True:
+            line = process.stdout.readline()
+            if not line and process.poll() is not None:
+                break
+            line = line.strip().lstrip("\r")
+            if not line:
+                continue
+            print(line)
+            if line.startswith("PROGRESS:"):
+                body = line[9:].strip()
+                frac_text, _, text = body.partition(" ")
+                try:
+                    last_progress = min(1.0, max(last_progress, float(frac_text)))
+                    last_status = text or last_status
+                except ValueError:
+                    last_status = body
+                yield None, last_status, last_progress
+            elif line.startswith("OUTPUT:"):
+                output_file = line[7:].strip()
+            elif line.startswith("ERROR:"):
+                yield None, line[6:].strip(), 0.0
+                return
+
+        return_code = process.returncode
+        if return_code == 0 and output_file and os.path.exists(output_file):
+            yield output_file, f"Done! Output saved to {output_file}", 1.0
+        elif return_code == 0:
+            yield None, "Finished but no output file was produced (see console log)", 0.0
+        else:
+            yield None, f"H3 regenerate failed (exit code {return_code}); see console log", 0.0
+    except Exception as e:
+        yield None, f"Error: {str(e)}", 0.0
+        import traceback
+        traceback.print_exc()
+
+
+def open_h3_regenerate(
+    input_video: Optional[str],
+    input_latents: str,
+    prompt: str,
+    resolution: str,
+    steps: str,
+    start_sigma: Optional[float],
+    input_size: str,
+    fwd: str,
+    vae: str,
+    seed: Optional[float],
+    vae_seed: Optional[float],
+    ckpt_dir: str,
+    weights_dir: str,
+    python_bin: str,
+) -> Generator[Tuple[Optional[str], str, float], None, None]:
+    """Open-H3-Regenerate-2K latent upscale + refine (768P/576P draft -> up to 4K).
+
+    Launched as a subprocess so the multi-hundred-GB refine pipeline frees VRAM on exit.
+    Code (NVlabs/Sana sol-engine) and weights (LoRA, latent upscaler, fast VAE) are
+    fetched automatically into weights/open_h3/ on first use; the local MiniMax-H3
+    Diffusers snapshot is used as the base model.
+    """
+    latents_path = str(input_latents or "").strip()
+    has_latents = bool(latents_path and os.path.exists(latents_path))
+    has_video = bool(input_video and os.path.exists(str(input_video)))
+    if not has_latents and not has_video:
+        yield None, "Error: Upload a draft video or provide a latents file", 0.0
+        return
+    if not prompt or not prompt.strip():
+        yield None, "Error: A prompt describing the clip is required (the refine follows it)", 0.0
+        return
+
+    source = latents_path if has_latents else str(input_video)
+    output_dir = os.path.join("outputs", "h3_regenerate")
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = int(time.time())
+    input_name = os.path.splitext(os.path.basename(source))[0]
+    output_path = os.path.abspath(
+        os.path.join(output_dir, f"{input_name}_h3regenerate_{resolution}_{timestamp}.mp4"))
+
+    script = os.path.join(ENGINE_DIR, "open_h3_regenerate.py")
+    cmd = [
+        (python_bin or "").strip() or sys.executable,
+        script,
+        "--prompt", prompt.strip(),
+        "--output", output_path,
+        "--ckpt-dir", os.path.abspath((ckpt_dir or "").strip() or "MiniMax-H3"),
+        "--weights-dir", os.path.abspath((weights_dir or "").strip() or os.path.join("weights", "open_h3")),
+        "--resolution", resolution,
+        "--steps", str(int(float(steps))),
+        "--input-size", input_size,
+        "--fwd", fwd,
+        "--vae", vae,
+        "--seed", str(int(seed) if seed and int(seed) > 0 else random.randint(0, 2**31 - 1)),
+        "--vae-seed", str(int(vae_seed) if vae_seed and int(vae_seed) > 0 else 42),
+    ]
+    if has_latents:
+        cmd.extend(["--input-latents", os.path.abspath(latents_path)])
+    else:
+        cmd.extend(["--input-video", os.path.abspath(source)])
+    if start_sigma and float(start_sigma) > 0:
+        cmd.extend(["--start-sigma", str(float(start_sigma))])
+
+    yield from _stream_open_h3_job(cmd)
+
+
 # UI setup
 with gr.Blocks(
     analytics_enabled=False,
@@ -2360,6 +2476,136 @@ with gr.Blocks(
                 fn=initial_load_interp_defaults,
                 inputs=None,
                 outputs=interp_ui_default_components
+            )
+
+        with gr.Tab("H3 Upscale (2K Regenerate)") as h3_regenerate_tab:
+            gr.Markdown(
+                "### Open-H3-Regenerate-2K\n"
+                "Upscales an H3 768P draft in latent space and regenerates it at up to 2560x1440 "
+                "(2K / 4K / 1080p / 768p) with a 2-3 step refine, per "
+                "[NVlabs/Sana Open-H3-Regenerate-2K](https://github.com/NVlabs/Sana/tree/sol-engine/models/Open-H3-Regenerate-2K). "
+                "The local MiniMax-H3 Diffusers model is reused as the base; the refine LoRA, latent "
+                "upscaler and sol-engine code download automatically into `weights/open_h3/` on first use."
+            )
+
+            with gr.Row():
+                # Input Column
+                with gr.Column(scale=1):
+                    h3r_input_video = gr.Video(label="Draft Video (H3 768P output)", sources=["upload"])
+                    h3r_prompt = gr.Textbox(
+                        label="Prompt",
+                        lines=3,
+                        placeholder="Describe the clip; the refine follows this prompt (use the original generation prompt if you have it)",
+                    )
+
+                    with gr.Accordion("Output Settings", open=True):
+                        h3r_resolution = gr.Dropdown(
+                            label="Output Resolution",
+                            choices=["768p", "1080p", "2k", "4k"],
+                            value="2k",
+                            info="2k = 2560x1440; 4k = two 2x latent upscales via 2K",
+                        )
+                        h3r_steps = gr.Dropdown(
+                            label="Refine Steps",
+                            choices=["3", "2"],
+                            value="3",
+                            info="3 = sharp (default), 2 = ~30% faster but softer on fine texture",
+                        )
+                        h3r_start_sigma = gr.Number(
+                            label="Start Sigma (0 = default grid)",
+                            value=0,
+                            minimum=0,
+                            maximum=1,
+                            step=0.05,
+                            info="Lower = keeps more of the draft, e.g. 0.8",
+                        )
+                        h3r_input_size = gr.Dropdown(
+                            label="Draft Encode Size",
+                            choices=["768p", "576p"],
+                            value="768p",
+                            info="768p for H3 drafts; 576p for drafts from other video models",
+                        )
+
+                    with gr.Accordion("Advanced", open=False):
+                        h3r_fwd = gr.Dropdown(
+                            label="Transformer Forward",
+                            choices=["standard", "sol_engine"],
+                            value="standard",
+                            info="sol_engine needs Sol-Attn + ~150GB VRAM (B200/GB200)",
+                        )
+                        h3r_vae = gr.Dropdown(
+                            label="Video Decoder",
+                            choices=["auto", "standard", "fast"],
+                            value="auto",
+                            info="auto: standard fwd -> released VAE, sol_engine fwd -> fast VAE; fast needs FlashAttention-4",
+                        )
+                        h3r_seed = gr.Number(label="Refine Seed (0 = random)", value=0, precision=0)
+                        h3r_vae_seed = gr.Number(label="Draft Encode (VAE) Seed", value=42, precision=0)
+                        h3r_latents = gr.Textbox(
+                            label="Input Latents (optional .pt, overrides video)",
+                            placeholder="torch.save({'video_latents': z}) with z [24,37,48,84] (768P) or [24,37,36,64] (576P)",
+                        )
+                        h3r_ckpt_dir = gr.Textbox(
+                            label="MiniMax-H3 Dir (base model)",
+                            value="MiniMax-H3",
+                            info="local MiniMaxAI/MiniMax-H3 Diffusers snapshot, reused as-is",
+                        )
+                        h3r_weights_dir = gr.Textbox(
+                            label="Download Dir",
+                            value="weights/open_h3",
+                            info="LoRA / latent upscaler / fast VAE / sol-engine code land here",
+                        )
+                        h3r_python = gr.Textbox(
+                            label="Python Executable (blank = same as this UI)",
+                            placeholder="blank uses the UI's python; point at an env with diffusers>=0.40 if needed",
+                        )
+
+                    h3r_btn = gr.Button("⬆ Upscale + Regenerate", variant="primary", elem_classes="green-btn")
+
+                # Output Column
+                with gr.Column(scale=1):
+                    h3r_output_video = gr.Video(label="Regenerated Video")
+                    h3r_status = gr.Textbox(label="Status", value="Ready", interactive=False)
+                    h3r_progress = gr.Slider(
+                        label="Progress",
+                        minimum=0,
+                        maximum=1,
+                        value=0,
+                        interactive=False,
+                        visible=True,
+                    )
+
+                    gr.Markdown("""
+                    **Notes:**
+                    - Only the first **121 frames (5 s @ 24 fps)** of the draft are used; other lengths are cut or padded
+                    - First use clones NVlabs/Sana (sol-engine branch) and downloads the merged refine LoRA, latent
+                      upscaler and adaln table (~several GB) into the Download Dir; the base model is never re-fetched
+                    - The refine pipeline needs a diffusers build with MiniMax-H3 support (diffusers >= 0.40);
+                      if this UI's env has an older one, set a Python Executable with the pipeline's requirements
+                    - `standard` forward + released VAE runs on consumer GPUs with enough VRAM; expect long runs at 4K
+                    """)
+
+            h3r_btn.click(
+                fn=open_h3_regenerate,
+                inputs=[
+                    h3r_input_video,
+                    h3r_latents,
+                    h3r_prompt,
+                    h3r_resolution,
+                    h3r_steps,
+                    h3r_start_sigma,
+                    h3r_input_size,
+                    h3r_fwd,
+                    h3r_vae,
+                    h3r_seed,
+                    h3r_vae_seed,
+                    h3r_ckpt_dir,
+                    h3r_weights_dir,
+                    h3r_python,
+                ],
+                outputs=[h3r_output_video, h3r_status, h3r_progress],
+                concurrency_id="heavy",
+                concurrency_limit=1,
             )
 
     # ===== MiniMax Event Handlers =====
