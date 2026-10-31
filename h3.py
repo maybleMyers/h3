@@ -1,4 +1,4 @@
-# h3.py — standalone MiniMax-H3 GUI (MiniMax + Frame Interpolation + Video Info tabs)
+# h3.py — standalone MiniMax-H3 GUI (MiniMax + Video Info + Frame Interpolation + H3 Upscale tabs)
 # Assembled from H1111/h1111.py (branch h3 @ ece03a2); backend lives in minimax_engine/.
 import os
 
@@ -19,6 +19,8 @@ from urllib.parse import quote as url_quote
 import sys
 from typing import List, Tuple, Optional, Generator, Dict, Any
 import json
+import glob
+import struct
 from gradio import themes
 from gradio.themes.utils import colors
 from PIL import Image
@@ -75,6 +77,21 @@ wan22_worker_instance = None
 UI_CONFIGS_DIR = "ui_configs"
 MINIMAX_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "minimax_defaults.json")
 INTERP_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "interp_defaults.json")
+H3R_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "h3_regenerate_defaults.json")
+
+
+def h3r_default_ckpt_dir() -> str:
+    """First local MiniMax-H3 Diffusers snapshot that actually looks complete."""
+    for name in ("MiniMax-H3", "MiniMax-H3-diffusers"):
+        if os.path.isfile(os.path.join(BASE_DIR, name, "model_index.json")):
+            return name
+    return "MiniMax-H3"
+
+
+def h3r_default_python() -> str:
+    """.venv-openh3 (diffusers >= 0.40 with MiniMax-H3 support) when it exists, else the UI's python."""
+    candidate = os.path.join(BASE_DIR, ".venv-openh3", "bin", "python")
+    return candidate if os.path.isfile(candidate) else ""
 
 
 # ===== Queue infrastructure (shared with the background worker) =====
@@ -487,6 +504,456 @@ def minimax_order_references(files, order_text: str):
             f"Reference order must use each of 1..{len(paths)} exactly once, got: {order_text!r}"
         )
     return [paths[i] for i in indexes]
+
+
+# =============================================================================
+# VRAM / RAM estimate — safetensors headers + request geometry only. No model is
+# ever loaded and no torch is pulled into the UI process.
+#
+# Weight bytes come from the file headers, with the dtype policy of
+# minimax_video/model_loader.py (fp8 targets, curve/int8 detection) applied on
+# paper. Sequence rows follow the packing geometry of minimax_video/packing.py
+# and packing_ref2va.py, whose checkpoint-contract constants are mirrored below.
+# Activations use the diffusers-mm calibration the engine itself budgets against
+# (0.158 GB per 1k packed rows, safety 1.2 — minimax_generate_video.py
+# `_apply_diffusers_mm`). The text-encoder stage is deliberately not estimated:
+# it runs before the DiT loads and is freed after, and its footprint is governed
+# by its own settings (Text Encoder GPU Layers / Stream).
+# =============================================================================
+
+MINIMAX_EST_CANVAS_MULTIPLE = 32
+MINIMAX_EST_SHORT_EDGE = 768
+MINIMAX_EST_MAX_PIXELS = 768 * 1344
+MINIMAX_EST_REF_IMAGE_SHORT_EDGE = 2048
+MINIMAX_EST_AUDIO_LATENTS_PER_SECOND = 40
+MINIMAX_EST_FPS = 24
+
+MINIMAX_EST_ACT_GB_PER_KROW = 0.158  # measured MiniMax-H3 activation slope (diffusers-mm)
+MINIMAX_EST_ACT_SAFETY = 1.2  # diffusers-mm's own safety factor
+MINIMAX_EST_ACT_CHUNK_CREDIT = 0.07  # row-wise transients --act_chunk_rows bounds (split is an estimate)
+
+# VAE encode/decode transient: the encoder's first stage runs block_out_channels[0]
+# channels over one clip_length-frame chunk, one tile at a time when tiling is on.
+# The decode runs fp16 autocast, so the activations are 2 bytes.
+MINIMAX_EST_VAE_ENCODER_CH = 128
+MINIMAX_EST_VAE_CLIP_FRAMES = 17
+MINIMAX_EST_VAE_TILE = 256
+MINIMAX_EST_VAE_TRANSIENT_TENSORS = 3
+
+# fp8 policy of minimax_video/model_loader.py (FP8_EXCLUDE_KEYS), mirrored by hand
+# because the UI process does not import torch.
+MINIMAX_EST_FP8_EXCLUDE_KEYS = (
+    "norm", "proj_in", "proj_out", "audio_proj_in", "audio_proj_out", "time_embedder",
+    "time_proj", "context_embedder", "token_refiner", "rope",
+)
+
+_SAFETENSORS_DTYPE_BYTES = {
+    "F64": 8, "F32": 4, "F16": 2, "BF16": 2, "F8_E4M3": 1, "F8_E5M2": 1,
+    "I64": 8, "I32": 4, "I16": 2, "I8": 1, "U8": 1, "BOOL": 1,
+}
+_EST_CACHE: Dict[str, Any] = {}
+
+
+def _est_safetensors_profile(path: str) -> Dict[str, Any]:
+    """Header-only profile of one safetensors file: byte sums split into the
+    swappable block stack and everything else, plus per-key numel/dtype. Cached."""
+    key = f"st|{path}|{os.path.getmtime(path)}|{os.path.getsize(path)}"
+    cached = _EST_CACHE.get(key)
+    if cached is not None:
+        return cached
+    with open(path, "rb") as f:
+        header_len = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(header_len))
+    total = block = 0
+    numels: Dict[str, int] = {}
+    dtypes: Dict[str, str] = {}
+    for name, entry in header.items():
+        if name == "__metadata__":
+            continue
+        numel = 1
+        for dim in entry["shape"]:
+            numel *= int(dim)
+        itemsize = _SAFETENSORS_DTYPE_BYTES.get(entry["dtype"], 2)
+        total += numel * itemsize
+        if name.startswith("transformer_blocks."):
+            block += numel * itemsize
+        numels[name] = numel
+        dtypes[name] = entry["dtype"]
+    profile = {
+        "total": total,
+        "block": block,
+        "numels": numels,
+        "dtypes": dtypes,
+        "curve": "adaln_t_table" in numels,
+        "int8": any(d == "I8" for d in dtypes.values()),
+    }
+    _EST_CACHE[key] = profile
+    return profile
+
+
+def _est_component_files(path: str) -> List[str]:
+    """The safetensors files behind a component path (override file or directory)."""
+    path = (path or "").strip()
+    if not path:
+        return []
+    if os.path.isdir(path):
+        return sorted(glob.glob(os.path.join(path, "*.safetensors")))
+    return [path] if os.path.isfile(path) else []
+
+
+def _est_component_bytes(files: List[str]) -> int:
+    return sum(_est_safetensors_profile(f)["total"] for f in files)
+
+
+def _est_dit_files(dit_path: str, ckpt_dir: str, task: str) -> List[str]:
+    """The DiT files the engine would load (model_loader.load_transformer): an
+    explicit single file / dir, else the task's partition of the diffusers model."""
+    tdir = (dit_path or "").strip() or os.path.join(
+        (ckpt_dir or "").strip(), "transformer_ref" if task == "ref2va" else "transformer")
+    if os.path.isdir(tdir):
+        return sorted(glob.glob(os.path.join(tdir, "*.safetensors")))
+    return [tdir] if tdir.endswith(".safetensors") and os.path.isfile(tdir) else []
+
+
+def _est_dit_weight_bytes(files: List[str], fp8: bool, fp8_scaled: bool, fp8_exclude_adaln: bool):
+    """(total, block_stack, kind) with the engine's dtype policy applied on paper."""
+    total = block = 0
+    curve = int8 = False
+    for path in files:
+        p = _est_safetensors_profile(path)
+        curve = curve or p["curve"]
+        int8 = int8 or p["int8"]
+        total += p["total"]
+        block += p["block"]
+        if fp8 or fp8_scaled:
+            for name, numel in p["numels"].items():
+                dtype = p["dtypes"][name]
+                if (
+                    name.endswith(".weight")
+                    and name.startswith("transformer_blocks.")
+                    and dtype in ("F16", "BF16", "F32")
+                    and not any(e in name for e in MINIMAX_EST_FP8_EXCLUDE_KEYS)
+                    and not (curve or fp8_exclude_adaln)
+                    and "adaln_proj" not in name
+                ):
+                    saved = numel * (_SAFETENSORS_DTYPE_BYTES[dtype] - 1)
+                    total -= saved
+                    block -= saved
+    kind = "int8 convrot" if int8 else ("curve-pruned" if curve else "full")
+    return total, block, kind
+
+
+def _est_video_latent_frames(num_frames: int) -> int:
+    """17n+5 pixel frames -> 5n+2 latent frames (packing.py)."""
+    return (num_frames - 5) // 17 * 5 + 2
+
+
+def _est_trim_frames(num_frames: int) -> int:
+    """Largest 17n+5 at most `num_frames` (packing_ref2va.trim_reference_num_frames)."""
+    if num_frames < 5:
+        return 1
+    return num_frames - ((num_frames - 5) % 17)
+
+
+def _est_audio_latents(num_frames: int) -> int:
+    return int(round(num_frames / MINIMAX_EST_FPS * MINIMAX_EST_AUDIO_LATENTS_PER_SECOND))
+
+
+def _est_resolve_canvas(aspect_w: float, aspect_h: float) -> Tuple[int, int]:
+    """Mirror of packing.resolve_canvas_size: 768 short edge, 768x1344 area cap, x32."""
+    ratio = aspect_w / aspect_h
+    if ratio >= 1.0:
+        w, h = MINIMAX_EST_SHORT_EDGE * ratio, float(MINIMAX_EST_SHORT_EDGE)
+    else:
+        w, h = float(MINIMAX_EST_SHORT_EDGE), MINIMAX_EST_SHORT_EDGE / ratio
+    area = w * h
+    if area > MINIMAX_EST_MAX_PIXELS:
+        scale = (MINIMAX_EST_MAX_PIXELS / area) ** 0.5
+        w, h = w * scale, h * scale
+    m = MINIMAX_EST_CANVAS_MULTIPLE
+    return max(m, round(h / m) * m), max(m, round(w / m) * m)
+
+
+def _est_ref_image_size(width: int, height: int) -> Tuple[int, int]:
+    """packing_ref2va.resolve_reference_image_size: 2048 short edge, x32. -> (h, w)."""
+    scale = MINIMAX_EST_REF_IMAGE_SHORT_EDGE / min(width, height)
+    m = MINIMAX_EST_CANVAS_MULTIPLE
+    return max(m, round(height * scale / m) * m), max(m, round(width * scale / m) * m)
+
+
+def _est_probe_media(path: str) -> Dict[str, Any]:
+    """kind / pixel size / fps / frame count / duration of a reference or keyframe,
+    via PIL headers and ffprobe only. Cached by (path, mtime)."""
+    try:
+        key = f"media|{path}|{os.path.getmtime(path)}"
+    except OSError:
+        return {"kind": "missing"}
+    cached = _EST_CACHE.get(key)
+    if cached is not None:
+        return cached
+    kind = minimax_reference_kind(path)
+    info: Dict[str, Any] = {"kind": kind}
+    try:
+        if kind == "image":
+            with Image.open(path) as im:
+                info["width"], info["height"] = im.size
+        else:
+            result = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", "-show_format", path],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
+            )
+            data = json.loads(result.stdout.decode("utf-8", "replace"))
+            duration = float(data.get("format", {}).get("duration", 0.0) or 0.0)
+            info["duration"] = duration
+            for stream in data.get("streams", []):
+                if kind == "video" and stream.get("codec_type") == "video":
+                    info["width"], info["height"] = int(stream["width"]), int(stream["height"])
+                    num, _, den = str(stream.get("r_frame_rate", "24/1")).partition("/")
+                    fps = float(num) / float(den or 1) if den else 24.0
+                    info["fps"] = fps or 24.0
+                    frames = stream.get("nb_frames")
+                    info["frames"] = int(frames) if frames and frames.isdigit() else round(info["fps"] * duration)
+                    break
+                if kind == "audio" and stream.get("codec_type") == "audio":
+                    break
+    except Exception as exc:
+        info["error"] = str(exc)
+    _EST_CACHE[key] = info
+    return info
+
+
+def _est_gpu_total_bytes() -> Optional[int]:
+    cached = _EST_CACHE.get("gpu_total")
+    if cached is not None:
+        return cached["bytes"]
+    total = None
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
+        )
+        first = result.stdout.decode().strip().splitlines()[0]
+        total = int(float(first)) * 1024 * 1024
+    except Exception:
+        try:
+            import torch  # only if nvidia-smi is unavailable; the UI otherwise stays torch-free
+            total = torch.cuda.get_device_properties(0).total_memory
+        except Exception:
+            total = None
+    _EST_CACHE["gpu_total"] = {"bytes": total}
+    return total
+
+
+def _est_host_total_bytes() -> Optional[int]:
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        return None
+    return None
+
+
+def _minimax_vram_estimate_text(
+    task_override, width, height, video_length, image_mode,
+    input_image, last_image, reference_files, reference_strip_audio,
+    chain_enable, chain_count, chain_mode, chain_context_length, chain_extend_video,
+    prompt,
+    ckpt_dir, dit_path, vae_path, audio_vae_path,
+    fp8, fp8_scaled, fp8_exclude_adaln,
+    blocks_to_swap, act_chunk_rows, vae_tiling, offload_engine,
+) -> str:
+    def gib(x):
+        return x / 2**30
+
+    refs = [str(f) for f in (reference_files or []) if f]
+    keyframes = [p for p in (input_image, last_image) if p]
+
+    if task_override and task_override != "auto":
+        task = task_override
+    elif refs:
+        task = "ref2va"
+    elif keyframes:
+        task = "fl2va"
+    else:
+        task = "t2va"
+
+    # ---- canvas (pipeline.setup: explicit, else keyframe/extend aspect, else 16:9)
+    if width and height:
+        canvas_h, canvas_w = int(height), int(width)
+    else:
+        anchor = None
+        if keyframes:
+            probe = _est_probe_media(keyframes[0])
+            anchor = (probe.get("width"), probe.get("height"))
+        elif chain_enable and chain_extend_video and os.path.isfile(str(chain_extend_video)):
+            probe = _est_probe_media(str(chain_extend_video))
+            anchor = (probe.get("width"), probe.get("height"))
+        if anchor and anchor[0] and anchor[1]:
+            canvas_h, canvas_w = _est_resolve_canvas(anchor[0], anchor[1])
+        else:
+            canvas_h, canvas_w = _est_resolve_canvas(16, 9)
+
+    # ---- duration
+    if image_mode:
+        num_frames = MINIMAX_IMAGE_MODE_FRAMES
+    elif not video_length or int(video_length) == 0:
+        durations = []
+        for path in refs:
+            probe = _est_probe_media(path)
+            if probe.get("kind") == "audio" and probe.get("duration"):
+                durations.append(probe["duration"])
+        num_frames = minimax_align_num_frames(round(max(durations) * MINIMAX_EST_FPS)) if durations else 124
+    else:
+        num_frames = minimax_align_num_frames(int(video_length))
+
+    # ---- packed sequence rows (packing.py geometry)
+    grid = (canvas_h // 32) * (canvas_w // 32)
+    video_rows = _est_video_latent_frames(num_frames) * grid
+    audio_rows = _est_audio_latents(num_frames) * 2  # stereo as two channel-major blocks
+    cond_video_rows = len(keyframes) * grid
+    ref_video_rows = ref_audio_rows = vision_rows = 0
+    ref_lines = []
+    for path in refs:
+        probe = _est_probe_media(path)
+        kind = probe.get("kind")
+        name = os.path.basename(path)
+        if kind == "image" and probe.get("width"):
+            rh, rw = _est_ref_image_size(probe["width"], probe["height"])
+            rows = (rh // 32) * (rw // 32)
+            ref_video_rows += rows
+            vision_rows += rows
+            ref_lines.append(f"image `{name}` @{rw}x{rh}: {rows // 1000}k rows")
+        elif kind == "video" and probe.get("width"):
+            frames24 = min(round(probe.get("frames", 0) * 24.0 / probe.get("fps", 24.0)), num_frames)
+            frames24 = _est_trim_frames(max(frames24, 5))
+            rh, rw = _est_resolve_canvas(probe["width"], probe["height"])
+            rows = _est_video_latent_frames(frames24) * (rh // 32) * (rw // 32)
+            ref_video_rows += rows
+            vision_rows += -(-frames24 // 12 // 2) * (rw // 32) * (rh // 32)  # 2 fps, merged in pairs
+            if not reference_strip_audio:
+                ref_audio_rows += _est_audio_latents(frames24) * 2
+            ref_lines.append(f"video `{name}` @{rw}x{rh} {frames24}f: {rows // 1000}k rows")
+        elif kind == "audio":
+            dur = min(probe.get("duration", 0.0), num_frames / MINIMAX_EST_FPS)
+            rows = _est_audio_latents(round(dur * MINIMAX_EST_FPS)) * 2
+            ref_audio_rows += rows
+            ref_lines.append(f"audio `{name}` {dur:.1f}s: {rows} rows")
+        else:
+            ref_lines.append(f"`{name}`: unreadable")
+    vision_rows += len(keyframes) * grid
+
+    # chaining adds conditioning per link
+    chain_rows = 0
+    if chain_enable and int(chain_count or 1) >= 2 or (chain_enable and chain_extend_video):
+        links = max(0, int(chain_count or 1) - 1) + (1 if chain_extend_video else 0)
+        if chain_mode == "motion":
+            ctx = max(1, int(chain_context_length or 0))
+            ctx = 1 if ctx == 1 else ctx - ((ctx - 5) % 17)  # motion_context_num_frames snaps down
+            chain_rows += _est_video_latent_frames(max(ctx, 5)) * grid + _est_audio_latents(max(ctx, 5)) * 2
+        elif chain_mode == "video":
+            chain_rows += links * (_est_video_latent_frames(num_frames) * grid + _est_audio_latents(num_frames) * 2)
+        elif chain_mode == "last_frame":
+            chain_rows += links * grid
+
+    text_rows = count_prompt_tokens(str(prompt or "")) + vision_rows + 512
+    seq_rows = video_rows + audio_rows + cond_video_rows + ref_video_rows + ref_audio_rows + chain_rows + text_rows
+
+    # ---- weights (headers only)
+    dit_files = _est_dit_files(dit_path, ckpt_dir, task)
+    if not dit_files:
+        return "*⚠️ DiT not found — check Checkpoint Dir / DiT Override.*"
+    dit_total, dit_block, dit_kind = _est_dit_weight_bytes(dit_files, fp8, fp8_scaled, fp8_exclude_adaln)
+    vae_files = _est_component_files(vae_path) or _est_component_files(
+        os.path.join((ckpt_dir or "").strip(), "vae"))
+    audio_vae_files = _est_component_files(audio_vae_path) or _est_component_files(
+        os.path.join((ckpt_dir or "").strip(), "audio_vae"))
+    vae_total = _est_component_bytes(vae_files)
+    audio_vae_total = _est_component_bytes(audio_vae_files)
+
+    # ---- denoise stage
+    swap = max(0, min(int(blocks_to_swap or 0), 49))
+    swapped_bytes = dit_block * swap // 50 if swap else 0
+    resident = dit_total - swapped_bytes
+    krow = seq_rows / 1000.0
+    act = MINIMAX_EST_ACT_GB_PER_KROW * krow * MINIMAX_EST_ACT_SAFETY
+    if act_chunk_rows and int(act_chunk_rows) > 0:
+        chunk_krow = min(krow, int(act_chunk_rows) / 1000.0)
+        act -= MINIMAX_EST_ACT_CHUNK_CREDIT * (krow - chunk_krow) * MINIMAX_EST_ACT_SAFETY
+    state_bytes = (video_rows + audio_rows + cond_video_rows + ref_video_rows + ref_audio_rows) * 24 * 4
+    embed_bytes = text_rows * 5120 * 4
+    denoise_peak = resident + act * 2**30 + state_bytes + embed_bytes
+
+    # ---- VAE condition-encode / decode stage
+    def vae_transient(frames: int, h: int, w: int) -> int:
+        th = min(h, MINIMAX_EST_VAE_TILE) if vae_tiling else h
+        tw = min(w, MINIMAX_EST_VAE_TILE) if vae_tiling else w
+        return MINIMAX_EST_VAE_ENCODER_CH * min(frames, MINIMAX_EST_VAE_CLIP_FRAMES) * th * tw * 2 * MINIMAX_EST_VAE_TRANSIENT_TENSORS
+
+    vae_transient_peak = vae_transient(MINIMAX_EST_VAE_CLIP_FRAMES, canvas_h, canvas_w)
+    for path in refs:
+        probe = _est_probe_media(path)
+        if probe.get("kind") == "image" and probe.get("width"):
+            rh, rw = _est_ref_image_size(probe["width"], probe["height"])
+            vae_transient_peak = max(vae_transient_peak, vae_transient(1, rh, rw))
+        elif probe.get("kind") == "video" and probe.get("width"):
+            rh, rw = _est_resolve_canvas(probe["width"], probe["height"])
+            vae_transient_peak = max(vae_transient_peak, vae_transient(MINIMAX_EST_VAE_CLIP_FRAMES, rh, rw))
+    vae_stage = vae_total + audio_vae_total + vae_transient_peak
+
+    peak = max(denoise_peak, vae_stage)
+    gpu_total = _est_gpu_total_bytes()
+    host_total = _est_host_total_bytes()
+
+    # ---- report
+    lines = [f"**Task** `{task}` · **canvas** {canvas_w}x{canvas_h} · **frames** {num_frames} "
+             f"({num_frames / MINIMAX_EST_FPS:.1f}s) · DiT: `{dit_kind}`"]
+    lines.append(
+        f"\n**Packed sequence** ≈ **{seq_rows // 1000}k rows** — video {video_rows // 1000}k · "
+        f"audio {audio_rows} · conditions {cond_video_rows + ref_video_rows + ref_audio_rows + chain_rows} · "
+        f"text+vision {text_rows}"
+    )
+    if ref_lines:
+        lines.append("\n" + "\n".join(f"- {line}" for line in ref_lines))
+    src = "DiT Override" if (dit_path or "").strip() else "diffusers checkpoint"
+    lines.append(
+        f"\n**Weights** ({src}): DiT {gib(dit_total):.1f} GiB (block stack {gib(dit_block):.1f}) · "
+        f"video VAE {gib(vae_total):.1f} · audio VAE {gib(audio_vae_total):.1f}"
+    )
+    swap_note = f" — block swap holds {gib(swapped_bytes):.1f} GiB ({swap}/50 blocks) on the host" if swap else ""
+    offload_note = " (diffusers-mm manages residency — estimate assumes none)" if offload_engine == "diffusers-mm" else ""
+    lines.append(
+        f"\n**Denoise stage**: {gib(resident):.1f} GiB weights{swap_note} + ~{act:.1f} GiB activations"
+        f"{offload_note} → **{gib(denoise_peak):.1f} GiB**"
+    )
+    lines.append(
+        f"\n**VAE stage** (condition encode + decode): {gib(vae_total + audio_vae_total):.1f} GiB weights + "
+        f"~{gib(vae_transient_peak):.1f} GiB transient{' (tiled)' if vae_tiling else ' (untiled!)'} → "
+        f"**{gib(vae_stage):.1f} GiB**"
+    )
+    verdict = ""
+    if gpu_total:
+        fit = "✅ fits" if peak <= gpu_total * 0.95 else "❌ exceeds"
+        verdict = f" — {fit} {gib(gpu_total):.0f} GiB GPU"
+    lines.append(f"\n### Peak VRAM ≈ **{gib(peak):.1f} GiB**{verdict}")
+    host_pinned = gib(swapped_bytes)
+    lines.append(
+        f"**Host RAM**: the DiT streams through ~{gib(dit_total):.1f} GiB of system memory while loading"
+        + (f", and block swap keeps {host_pinned:.1f} GiB pinned resident" if swap else "")
+        + (f" of {gib(host_total):.0f} GiB total" if host_total else "") + "."
+    )
+    lines.append("\n*Header/geometry exact; activations calibrated ±20% (diffusers-mm slope). "
+                 "Text-encoder stage not included (runs before the DiT, freed after).*")
+    return "\n".join(lines)
+
+
+def minimax_vram_estimate_text(*args):
+    try:
+        return _minimax_vram_estimate_text(*args)
+    except Exception as exc:
+        logger.warning("VRAM estimate failed", exc_info=True)
+        return f"*⚠️ estimate failed: {exc}*"
 
 
 MINIMAX_TAEHV_DEFAULT = os.path.join("weights", "taeh3.safetensors")
@@ -1460,6 +1927,125 @@ def upscale_video(
         traceback.print_exc()
 
 
+def _stream_open_h3_job(cmd: List[str]) -> Generator[Tuple[Optional[str], str, float], None, None]:
+    """Run the open_h3_regenerate.py driver and parse its PROGRESS/OUTPUT/ERROR protocol."""
+    last_status = "Starting..."
+    last_progress = 0.0
+    output_file = None
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        while True:
+            line = process.stdout.readline()
+            if not line and process.poll() is not None:
+                break
+            line = line.strip().lstrip("\r")
+            if not line:
+                continue
+            print(line)
+            if line.startswith("PROGRESS:"):
+                body = line[9:].strip()
+                frac_text, _, text = body.partition(" ")
+                try:
+                    last_progress = min(1.0, max(last_progress, float(frac_text)))
+                    last_status = text or last_status
+                except ValueError:
+                    last_status = body
+                yield None, last_status, last_progress
+            elif line.startswith("OUTPUT:"):
+                output_file = line[7:].strip()
+            elif line.startswith("ERROR:"):
+                yield None, line[6:].strip(), 0.0
+                return
+
+        return_code = process.returncode
+        if return_code == 0 and output_file and os.path.exists(output_file):
+            yield output_file, f"Done! Output saved to {output_file}", 1.0
+        elif return_code == 0:
+            yield None, "Finished but no output file was produced (see console log)", 0.0
+        else:
+            yield None, f"H3 regenerate failed (exit code {return_code}); see console log", 0.0
+    except Exception as e:
+        yield None, f"Error: {str(e)}", 0.0
+        import traceback
+        traceback.print_exc()
+
+
+def open_h3_regenerate(
+    input_video: Optional[str],
+    input_latents: str,
+    prompt: str,
+    resolution: str,
+    steps: str,
+    start_sigma: Optional[float],
+    input_size: str,
+    fit_aspect: bool,
+    fwd: str,
+    vae: str,
+    seed: Optional[float],
+    vae_seed: Optional[float],
+    ckpt_dir: str,
+    weights_dir: str,
+    python_bin: str,
+) -> Generator[Tuple[Optional[str], str, float], None, None]:
+    """Open-H3-Regenerate-2K latent upscale + refine (768P/576P draft -> up to 4K).
+
+    Launched as a subprocess so the multi-hundred-GB refine pipeline frees VRAM on exit.
+    Code (NVlabs/Sana sol-engine) and weights (LoRA, latent upscaler, fast VAE) are
+    fetched automatically into weights/open_h3/ on first use; the local MiniMax-H3
+    Diffusers snapshot is used as the base model.
+    """
+    latents_path = str(input_latents or "").strip()
+    has_latents = bool(latents_path and os.path.exists(latents_path))
+    has_video = bool(input_video and os.path.exists(str(input_video)))
+    if not has_latents and not has_video:
+        yield None, "Error: Upload a draft video or provide a latents file", 0.0
+        return
+    if not prompt or not prompt.strip():
+        yield None, "Error: A prompt describing the clip is required (the refine follows it)", 0.0
+        return
+
+    source = latents_path if has_latents else str(input_video)
+    output_dir = os.path.join("outputs", "h3_regenerate")
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = int(time.time())
+    input_name = os.path.splitext(os.path.basename(source))[0]
+    output_path = os.path.abspath(
+        os.path.join(output_dir, f"{input_name}_h3regenerate_{resolution}_{timestamp}.mp4"))
+
+    script = os.path.join(ENGINE_DIR, "open_h3_regenerate.py")
+    cmd = [
+        (python_bin or "").strip() or sys.executable,
+        script,
+        "--prompt", prompt.strip(),
+        "--output", output_path,
+        "--ckpt-dir", os.path.abspath((ckpt_dir or "").strip() or h3r_default_ckpt_dir()),
+        "--weights-dir", os.path.abspath((weights_dir or "").strip() or os.path.join("weights", "open_h3")),
+        "--resolution", resolution,
+        "--steps", str(int(float(steps))),
+        "--input-size", input_size,
+        "--fwd", fwd,
+        "--vae", vae,
+        "--seed", str(int(seed) if seed and int(seed) > 0 else random.randint(0, 2**31 - 1)),
+        "--vae-seed", str(int(vae_seed) if vae_seed and int(vae_seed) > 0 else 42),
+    ]
+    if fit_aspect:
+        cmd.append("--fit-aspect")
+    if has_latents:
+        cmd.extend(["--input-latents", os.path.abspath(latents_path)])
+    else:
+        cmd.extend(["--input-video", os.path.abspath(source)])
+    if start_sigma and float(start_sigma) > 0:
+        cmd.extend(["--start-sigma", str(float(start_sigma))])
+
+    yield from _stream_open_h3_job(cmd)
+
+
 # UI setup
 with gr.Blocks(
     analytics_enabled=False,
@@ -2069,6 +2655,12 @@ with gr.Blocks(
                     minimax_load_defaults_btn = gr.Button("Load Defaults")
                     minimax_defaults_status = gr.Textbox(label="Defaults Status", interactive=False, visible=False)
 
+            with gr.Accordion("VRAM / RAM Estimate", open=False):
+                minimax_vram_estimate = gr.Markdown(
+                    "_Peak VRAM/RAM for this request, computed from checkpoint headers and the packed-sequence "
+                    "geometry — no model is loaded. Updates when any setting changes._"
+                )
+
         with gr.Tab("Video Info") as video_info_tab:
             with gr.Row():
                 video_input = gr.Video(label="Upload Video", interactive=True)
@@ -2360,6 +2952,201 @@ with gr.Blocks(
                 fn=initial_load_interp_defaults,
                 inputs=None,
                 outputs=interp_ui_default_components
+            )
+
+        with gr.Tab("H3 Upscale (2K Regenerate)") as h3_regenerate_tab:
+            gr.Markdown(
+                "### Open-H3-Regenerate-2K\n"
+                "Upscales an H3 768P draft in latent space and regenerates it at up to 2560x1440 "
+                "(2K / 4K / 1080p / 768p) with a 2-3 step refine, per "
+                "[NVlabs/Sana Open-H3-Regenerate-2K](https://github.com/NVlabs/Sana/tree/sol-engine/models/Open-H3-Regenerate-2K). "
+                "The local MiniMax-H3 Diffusers model is reused as the base; the refine LoRA, latent "
+                "upscaler and sol-engine code download automatically into `weights/open_h3/` on first use."
+            )
+
+            with gr.Row():
+                # Input Column
+                with gr.Column(scale=1):
+                    h3r_input_video = gr.Video(label="Draft Video (H3 768P output)", sources=["upload"])
+                    h3r_prompt = gr.Textbox(
+                        label="Prompt",
+                        lines=3,
+                        placeholder="Describe the clip; the refine follows this prompt (use the original generation prompt if you have it)",
+                    )
+
+                    with gr.Accordion("Output Settings", open=True):
+                        h3r_resolution = gr.Dropdown(
+                            label="Output Resolution",
+                            choices=["768p", "1080p", "2k", "4k"],
+                            value="2k",
+                            info="2k = 2560x1440; 4k = two 2x latent upscales via 2K",
+                        )
+                        h3r_steps = gr.Dropdown(
+                            label="Refine Steps",
+                            choices=["3", "2"],
+                            value="3",
+                            info="3 = sharp (default), 2 = ~30% faster but softer on fine texture",
+                        )
+                        h3r_start_sigma = gr.Number(
+                            label="Start Sigma (0 = default grid)",
+                            value=0,
+                            minimum=0,
+                            maximum=1,
+                            step=0.05,
+                            info="Lower = keeps more of the draft, e.g. 0.8",
+                        )
+                        h3r_input_size = gr.Dropdown(
+                            label="Draft Encode Size",
+                            choices=["768p", "576p"],
+                            value="768p",
+                            info="pixel budget for the draft encode: 768p for H3 drafts; 576p for drafts from "
+                                 "other video models",
+                        )
+                        h3r_fit_aspect = gr.Checkbox(
+                            label="Preserve Source Aspect (no crop)",
+                            value=True,
+                            info="encode the full frame at its own aspect ratio (rounded to 32 px) and refine at "
+                                 "an aspect-matched grid; off = crop to 16:9 like the upstream pipeline",
+                        )
+
+                    with gr.Accordion("Advanced", open=False):
+                        h3r_fwd = gr.Dropdown(
+                            label="Transformer Forward",
+                            choices=["standard", "sol_engine"],
+                            value="standard",
+                            info="sol_engine needs Sol-Attn + ~150GB VRAM (B200/GB200)",
+                        )
+                        h3r_vae = gr.Dropdown(
+                            label="Video Decoder",
+                            choices=["auto", "standard", "fast"],
+                            value="auto",
+                            info="auto: standard fwd -> released VAE, sol_engine fwd -> fast VAE; fast needs FlashAttention-4",
+                        )
+                        h3r_seed = gr.Number(label="Refine Seed (0 = random)", value=0, precision=0)
+                        h3r_vae_seed = gr.Number(label="Draft Encode (VAE) Seed", value=42, precision=0)
+                        h3r_latents = gr.Textbox(
+                            label="Input Latents (optional .pt, overrides video)",
+                            placeholder="torch.save({'video_latents': z}) with z [24,37,48,84] (768P) or [24,37,36,64] (576P)",
+                        )
+                        h3r_ckpt_dir = gr.Textbox(
+                            label="MiniMax-H3 Dir (base model)",
+                            value=h3r_default_ckpt_dir(),
+                            info="local MiniMaxAI/MiniMax-H3 Diffusers snapshot, reused as-is",
+                        )
+                        h3r_weights_dir = gr.Textbox(
+                            label="Download Dir",
+                            value="weights/open_h3",
+                            info="LoRA / latent upscaler / fast VAE / sol-engine code land here",
+                        )
+                        h3r_python = gr.Textbox(
+                            label="Python Executable (blank = same as this UI)",
+                            value=h3r_default_python(),
+                            placeholder="blank uses the UI's python; point at an env with diffusers>=0.40 if needed",
+                        )
+
+                    h3r_btn = gr.Button("⬆ Upscale + Regenerate", variant="primary", elem_classes="green-btn")
+                    with gr.Row():
+                        h3r_save_defaults_btn = gr.Button("💾 Save Defaults")
+                        h3r_load_defaults_btn = gr.Button("📂 Load Defaults")
+
+                # Output Column
+                with gr.Column(scale=1):
+                    h3r_output_video = gr.Video(label="Regenerated Video")
+                    h3r_status = gr.Textbox(label="Status", value="Ready", interactive=False)
+                    h3r_progress = gr.Slider(
+                        label="Progress",
+                        minimum=0,
+                        maximum=1,
+                        value=0,
+                        interactive=False,
+                        visible=True,
+                    )
+
+                    gr.Markdown("""
+                    **Notes:**
+                    - Only the first **121 frames (5 s @ 24 fps)** of the draft are used; other lengths are cut or padded
+                    - First use clones NVlabs/Sana (sol-engine branch) and downloads the merged refine LoRA, latent
+                      upscaler and adaln table (~several GB) into the Download Dir; the base model is never re-fetched
+                    - The refine pipeline needs a diffusers build with MiniMax-H3 support (diffusers >= 0.40);
+                      if this UI's env has an older one, set a Python Executable with the pipeline's requirements
+                    - `standard` forward + released VAE runs on consumer GPUs with enough VRAM; expect long runs at 4K
+                    """)
+
+            h3r_btn.click(
+                fn=open_h3_regenerate,
+                inputs=[
+                    h3r_input_video,
+                    h3r_latents,
+                    h3r_prompt,
+                    h3r_resolution,
+                    h3r_steps,
+                    h3r_start_sigma,
+                    h3r_input_size,
+                    h3r_fit_aspect,
+                    h3r_fwd,
+                    h3r_vae,
+                    h3r_seed,
+                    h3r_vae_seed,
+                    h3r_ckpt_dir,
+                    h3r_weights_dir,
+                    h3r_python,
+                ],
+                outputs=[h3r_output_video, h3r_status, h3r_progress],
+                concurrency_id="heavy",
+                concurrency_limit=1,
+            )
+
+            # ===== H3 Upscale defaults =====
+            # Per-job fields (video, prompt, latents, refine seed) stay out of the file.
+            h3r_ui_default_components = [
+                h3r_resolution, h3r_steps, h3r_start_sigma, h3r_input_size, h3r_fit_aspect,
+                h3r_fwd, h3r_vae, h3r_vae_seed, h3r_ckpt_dir, h3r_weights_dir, h3r_python,
+            ]
+            h3r_ui_default_keys = [
+                "h3r_resolution", "h3r_steps", "h3r_start_sigma", "h3r_input_size", "h3r_fit_aspect",
+                "h3r_fwd", "h3r_vae", "h3r_vae_seed", "h3r_ckpt_dir", "h3r_weights_dir", "h3r_python",
+            ]
+
+            def save_h3r_defaults(*values):
+                os.makedirs(UI_CONFIGS_DIR, exist_ok=True)
+                settings_to_save = dict(zip(h3r_ui_default_keys, values))
+                try:
+                    with open(H3R_DEFAULTS_FILE, 'w') as f:
+                        json.dump(settings_to_save, f, indent=2)
+                    return "H3 Upscale defaults saved successfully."
+                except Exception as e:
+                    return f"Error saving H3 Upscale defaults: {e}"
+
+            def load_h3r_defaults(request: gr.Request = None):
+                if not os.path.exists(H3R_DEFAULTS_FILE):
+                    return [gr.update()] * len(h3r_ui_default_keys) + (["No defaults file found."] if request else [""])
+                try:
+                    with open(H3R_DEFAULTS_FILE, 'r') as f:
+                        loaded_settings = json.load(f)
+                except Exception as e:
+                    return [gr.update()] * len(h3r_ui_default_keys) + [f"Error loading defaults: {e}"]
+                updates = [gr.update(value=loaded_settings.get(key, getattr(component, 'value', None)))
+                           for key, component in zip(h3r_ui_default_keys, h3r_ui_default_components)]
+                return updates + ["H3 Upscale defaults loaded successfully."]
+
+            h3r_save_defaults_btn.click(
+                fn=save_h3r_defaults,
+                inputs=h3r_ui_default_components,
+                outputs=[h3r_status],
+            )
+            h3r_load_defaults_btn.click(
+                fn=load_h3r_defaults,
+                inputs=None,
+                outputs=h3r_ui_default_components + [h3r_status],
+            )
+
+            def initial_load_h3r_defaults():
+                return load_h3r_defaults(None)[:-1]
+
+            demo.load(
+                fn=initial_load_h3r_defaults,
+                inputs=None,
+                outputs=h3r_ui_default_components,
             )
 
     # ===== MiniMax Event Handlers =====
@@ -2722,6 +3509,31 @@ with gr.Blocks(
         inputs=[minimax_chain_mode],
         outputs=[minimax_chain_motion_group],
     )
+
+    minimax_vram_estimate_inputs = [
+        minimax_task_override, minimax_width, minimax_height, minimax_video_length, minimax_image_mode,
+        minimax_input_image, minimax_last_image, minimax_reference_state, minimax_reference_strip_audio,
+        minimax_chain_enable, minimax_chain_count, minimax_chain_mode, minimax_chain_context_length,
+        minimax_chain_extend_video,
+        minimax_prompt,
+        minimax_ckpt_dir, minimax_dit_path, minimax_vae_path, minimax_audio_vae_path,
+        minimax_fp8, minimax_fp8_scaled, minimax_fp8_exclude_adaln,
+        minimax_blocks_to_swap, minimax_act_chunk_rows, minimax_vae_tiling, minimax_offload_engine,
+    ]
+    for _component in minimax_vram_estimate_inputs:
+        if _component is minimax_reference_state:
+            continue
+        _component.change(fn=minimax_vram_estimate_text, inputs=minimax_vram_estimate_inputs,
+                          outputs=[minimax_vram_estimate])
+    for _event in (minimax_reference_upload_dep.then, minimax_reference_remove_dep.then,
+                   minimax_reference_clear_dep.then):
+        _event(fn=minimax_vram_estimate_text, inputs=minimax_vram_estimate_inputs,
+               outputs=[minimax_vram_estimate])
+    try:
+        minimax_vram_estimate.value = minimax_vram_estimate_text(
+            *[getattr(_c, "value", None) for _c in minimax_vram_estimate_inputs])
+    except Exception:
+        logger.warning("initial VRAM estimate failed", exc_info=True)
 
     minimax_ui_default_components_ORDERED_LIST = [
         minimax_ckpt_dir,
